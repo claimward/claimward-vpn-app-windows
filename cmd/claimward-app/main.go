@@ -69,8 +69,19 @@ func run() error {
 	spec := application.Spec{Name: "Claimward", Identifier: "org.claimward.vpn", Version: version}
 	return application.Run(spec, application.Config{Title: windowTitle, Width: 460, Height: 720}, view, func() {
 		// The tray joins once the window's loop runs, as application.Run
-		// does for a Spec.Tray; it is attached here so that the binding
-		// can change its menu.
-		go func() { _ = t.Attach() }()
+		// does for a Spec.Tray. It is not a Spec.Tray because Spec.Tray
+		// builds its menu once and keeps the *tray.Tray to itself, and the
+		// binding above must change the menu as the status changes.
+		//
+		// Attach is implemented on Windows since tray v0.14.0 (before, it
+		// answered tray.ErrNoBackend, which this call ignored: there was no
+		// tray icon at all). A tray that cannot be attached is reported but
+		// does not stop the app: closing the window quits it, so the tray is
+		// a shortcut here, not the only way back to the window.
+		go func() {
+			if err := t.Attach(); err != nil {
+				fmt.Fprintln(os.Stderr, "claimward-app: no tray icon:", err)
+			}
+		}()
 	})
 }

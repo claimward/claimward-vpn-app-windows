@@ -1,0 +1,13 @@
+# Build output (scripts/package.sh)
+/bin/
+/dist/
+*.test
+*.exe
+
+# Go
+*.out
+go.work
+go.work.sum
+
+# OS
+.DS_Store

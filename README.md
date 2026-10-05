@@ -63,7 +63,7 @@ tray click arrives on the tray's thread and is posted likewise.
 | Path | What |
 |------|------|
 | `cmd/claimward-app` | the app: window + tray (`application.Run`), Windows window lookup and the browser opener |
-| `cmd/claimward-helper` | the helper service: `install`, `uninstall`, `run` (golang.org/x/sys/windows/svc) |
+| `cmd/claimward-helper` | the helper service: `install`, `uninstall`, `run`, `version` (golang.org/x/sys/windows/svc) |
 | `internal/ui` | ViewModel, View, tray binding, window handler — 100% covered by tests that run on any OS |
 | `internal/brand` | the tray icon (from [claimward/brand](https://github.com/claimward/brand)) |
 | `scripts/install.ps1`, `scripts/uninstall.ps1` | install / remove on a machine |
@@ -82,7 +82,7 @@ person in several who connects without choosing is told to choose, and the
 choice appears); the **settings** (server URL, provider, GitHub client id or
 OIDC issuer and client id), saved to `%AppData%\Claimward\config.json`; and the
 connection log. The tray menu shows the status and offers Connect, Disconnect,
-Open and Quit.
+*Open Claimward* and Quit.
 
 Closing the window quits the app. The tunnel belongs to the helper service and
 stays up; Disconnect takes it down.
@@ -204,6 +204,8 @@ The gates CI runs:
 
 ```sh
 test -z "$(gofmt -l .)"
+# the MVVM gate is the reusable workflow go-widgets/mvvmlint/.github/workflows/mvvmlint.yml@main;
+# locally, its equivalent:
 go install github.com/go-widgets/mvvmlint/cmd/mvvmlint@latest
 go vet -vettool="$(go env GOPATH)/bin/mvvmlint" ./...
 go install github.com/go-widgets/bricolint/cmd/bricolint@v0.1.0

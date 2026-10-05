@@ -4,12 +4,12 @@ go 1.27.1
 
 require (
 	github.com/claimward/claimward-vpn-client v0.3.1
-	github.com/go-widgets/application v0.6.0
+	github.com/go-widgets/application v0.7.0
 	github.com/go-widgets/mvvm v0.11.0
-	github.com/go-widgets/mvvmtk v0.14.0
+	github.com/go-widgets/mvvmtk v0.14.1
 	github.com/go-widgets/painter v0.15.0
-	github.com/go-widgets/toolkit v0.325.0
-	github.com/go-widgets/tray v0.13.0
+	github.com/go-widgets/toolkit v0.326.0
+	github.com/go-widgets/tray v0.14.0
 	golang.org/x/sys v0.48.0
 )
 
@@ -40,7 +40,7 @@ require (
 	github.com/go-richdoc/richdoc v0.4.0 // indirect
 	github.com/go-typeset/bidi v0.3.0 // indirect
 	github.com/go-widgets/android v0.13.1 // indirect
-	github.com/go-widgets/window v0.83.0 // indirect
+	github.com/go-widgets/window v0.86.0 // indirect
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/sergeymakinen/go-bmp v1.0.0 // indirect
 	github.com/sergeymakinen/go-ico v1.0.0 // indirect

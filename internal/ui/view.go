@@ -56,6 +56,14 @@ type widgets struct {
 // cards are the CardLayouts that show one of several things: the page, and
 // the panels that appear only when they apply. Each one's Active is bound to
 // a ViewModel observable.
+//
+// The page switch was a CardLayout rather than a toolkit.Stack because a
+// Stack was not part of focus traversal, so the settings fields took no keys
+// (go-widgets/toolkit#480). Stack does take part since toolkit v0.326.0; the
+// CardLayout is kept because the ViewModel's pages are ints that bind
+// straight to Active, while Stack.Visible is a string observable and mvvm
+// has no converting binding. Both keep the inactive pages out of the focus
+// walk, so the switch would change nothing the user can see.
 type cards struct {
 	page, signIn, tenant, provider *toolkit.CardLayout
 }
@@ -130,16 +138,16 @@ func bindView(vm *ViewModel, invalidate, relayout func()) (*widgets, *cards, []f
 		mvvmtk.BindLabel(w.deviceURI, vm.DeviceURI, invalidate),
 		mvvmtk.BindLabel(w.pathLabel, vm.ConfigPath, invalidate),
 
-		bindCommand(w.settings, vm.OpenSettings, invalidate),
-		bindCommand(w.openPage, vm.OpenSignInPage, invalidate),
-		bindCommand(w.cancelSignIn, vm.CancelSignIn, invalidate),
-		bindCommand(w.signIn, vm.SignIn, invalidate),
-		bindCommand(w.signOut, vm.SignOut, invalidate),
-		bindCommand(w.connect, vm.Connect, invalidate),
-		bindCommand(w.disconnect, vm.Disconnect, invalidate),
-		bindCommand(w.chooseTenant, vm.ChooseTenant, invalidate),
-		bindCommand(w.save, vm.SaveSettings, invalidate),
-		bindCommand(w.cancel, vm.CloseSettings, invalidate),
+		mvvmtk.BindCommand(w.settings, vm.OpenSettings, invalidate),
+		mvvmtk.BindCommand(w.openPage, vm.OpenSignInPage, invalidate),
+		mvvmtk.BindCommand(w.cancelSignIn, vm.CancelSignIn, invalidate),
+		mvvmtk.BindCommand(w.signIn, vm.SignIn, invalidate),
+		mvvmtk.BindCommand(w.signOut, vm.SignOut, invalidate),
+		mvvmtk.BindCommand(w.connect, vm.Connect, invalidate),
+		mvvmtk.BindCommand(w.disconnect, vm.Disconnect, invalidate),
+		mvvmtk.BindCommand(w.chooseTenant, vm.ChooseTenant, invalidate),
+		mvvmtk.BindCommand(w.save, vm.SaveSettings, invalidate),
+		mvvmtk.BindCommand(w.cancel, vm.CloseSettings, invalidate),
 
 		mvvmtk.BindDropDownOptions(w.tenantPick, vm.TenantNames, func(s string) string { return s }, invalidate),
 		mvvmtk.BindSelectedIndex(w.tenantPick, vm.TenantIndex, invalidate),
@@ -157,22 +165,6 @@ func bindView(vm *ViewModel, invalidate, relayout func()) (*widgets, *cards, []f
 		mvvm.OneWay(vm.ProviderPanel, &c.provider.Active, onCard),
 	}
 	return w, c, unbind
-}
-
-// bindCommand is mvvmtk.BindCommand plus the button's Disabled state.
-//
-// mvvmtk.BindCommand (v0.14.0) shows a command that cannot run only by
-// switching the button to the secondary style: the button still looks
-// pressable, takes focus and answers a click (which Execute then ignores).
-// A Connect button that looks live while a connection is under way invites
-// the second click this app must not take, so the button is also disabled,
-// from the same CanExecute.
-func bindCommand(b *toolkit.Button, c *mvvm.Command, invalidate func()) (unbind func()) {
-	u := mvvmtk.BindCommand(b, c, invalidate)
-	set := func() { b.Disabled().Set(!c.CanExecute()) }
-	set()
-	unsub := c.SubscribeCanExecuteChanged(set)
-	return func() { unsub(); u() }
 }
 
 func providerLabels() []string {

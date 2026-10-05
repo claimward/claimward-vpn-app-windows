@@ -1,0 +1,159 @@
+# CI for the Claimward Windows app.
+#
+#   checks     (ubuntu)   gofmt; go vet for linux and windows/amd64+arm64;
+#                         tests with internal/ui held at 100% coverage;
+#                         cross-build windows/amd64 + windows/arm64 and the
+#                         release packages (Wintun pinned by SHA-256).
+#   mvvm       (ubuntu)   the go-widgets MVVM gate (mvvmlint): no direct
+#                         widget-state writes.
+#   bricolint  (ubuntu)   the hand-drawn-UI gate, with its negative control.
+#   windows    (windows-latest)
+#                         vet, tests and builds on Windows; then the package
+#                         is INSTALLED with install.ps1: the service must run,
+#                         the ACLs must be as the README says, and the helper
+#                         must answer on its socket; then uninstall.ps1.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GOWORK: "off"
+  CGO_ENABLED: "0"
+
+jobs:
+  checks:
+    name: checks, tests, cross-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.1"
+          cache: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: GOOS=windows GOARCH=amd64 go vet ./...
+      - run: GOOS=windows GOARCH=arm64 go vet ./...
+      - name: Tests (internal/ui at 100%)
+        run: |
+          go test -count=1 -coverprofile=coverage.out ./...
+          ui=$(go tool cover -func=coverage.out | grep '/internal/ui/' | grep -v '100.0%' || true)
+          if [ -n "$ui" ]; then echo "::error::internal/ui below 100%"; echo "$ui"; exit 1; fi
+      - name: Race
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 ./internal/...
+      - name: Package (windows/amd64, windows/arm64)
+        run: VERSION="ci-${GITHUB_SHA::12}" ./scripts/package.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: claimward-windows
+          path: dist/*.zip
+          if-no-files-found: error
+
+  mvvm:
+    name: MVVM gate
+    uses: go-widgets/mvvmlint/.github/workflows/mvvmlint.yml@main
+
+  bricolint:
+    name: Hand-drawn-UI gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.1"
+          cache: true
+      - run: go install github.com/go-widgets/bricolint/cmd/bricolint@v0.1.0
+      - run: go vet -vettool="$(go env GOPATH)/bin/bricolint" ./...
+      - name: Negative control (the guard must bite)
+        run: BRICOLINT="$(go env GOPATH)/bin/bricolint" bash hack/bricolint-negative-control.sh
+
+  windows:
+    name: windows (tests, install, service, ACLs)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.1"
+          cache: true
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+      - name: Package (as scripts/package.sh does, in PowerShell)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = 'dist\claimward-windows-amd64'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          go build -trimpath -ldflags "-X main.version=ci -H windowsgui" -o "$out\claimward-app.exe" ./cmd/claimward-app
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go build -trimpath -ldflags "-X main.version=ci" -o "$out\claimward-helper.exe" ./cmd/claimward-helper
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $want = (Select-String -Path scripts\package.sh -Pattern '^WINTUN_SHA256="([0-9a-f]{64})"').Matches[0].Groups[1].Value
+          $zip = Join-Path $env:RUNNER_TEMP 'wintun.zip'
+          Invoke-WebRequest -Uri 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile $zip
+          $got = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($got -ne $want) { throw "wintun zip SHA-256 $got, want $want" }
+          Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP -Force
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'wintun\bin\amd64\wintun.dll') $out
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'wintun\LICENSE.txt') "$out\wintun-LICENSE.txt"
+          Copy-Item scripts\install.ps1, scripts\uninstall.ps1, LICENSE, README.md $out
+          & "$out\claimward-helper.exe" version
+      - name: Install, check, uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = Resolve-Path dist\claimward-windows-amd64
+          & "$pkg\install.ps1" -Server https://vpn.example.org -Provider github -GitHubClientId Iv1.ci
+          Start-Sleep -Seconds 3
+
+          $svc = Get-Service ClaimwardHelper
+          if ($svc.Status -ne 'Running') { Get-Content C:\ProgramData\Claimward\helper.log -ErrorAction SilentlyContinue; throw "ClaimwardHelper is $($svc.Status)" }
+          $cim = Get-CimInstance Win32_Service -Filter "Name='ClaimwardHelper'"
+          if ($cim.StartName -ne 'LocalSystem') { throw "runs as $($cim.StartName)" }
+          if ($cim.PathName -notlike "*Program Files\Claimward\claimward-helper.exe*") { throw "runs $($cim.PathName)" }
+          Get-Content C:\ProgramData\Claimward\helper.log
+
+          # The directory, as the helper left it: SYSTEM's, protected, the
+          # group allowed to list and traverse only.
+          $sid = (Get-LocalGroup 'Claimward Users').SID.Value
+          $dir = (Get-Acl C:\ProgramData\Claimward).Sddl
+          Write-Host "directory: $dir"
+          if ($dir -notmatch '^O:SY') { throw "directory owner: $dir" }
+          if ($dir -notmatch 'D:PAI?\(') { throw "directory DACL not protected: $dir" }
+          if ($dir -notmatch [regex]::Escape("(A;;0x1200a9;;;$sid)")) { throw "directory: the group's entry is not list/traverse: $dir" }
+          if ($dir -match '(;;;BU\)|;;;AU\)|;;;WD\)|;;;CO\))') { throw "directory grants Users/Everyone/Creator Owner: $dir" }
+          $cfg = (Get-Acl C:\ProgramData\Claimward\helper.json).Sddl
+          Write-Host "helper.json: $cfg"
+          if ($cfg -match [regex]::Escape($sid)) { throw "helper.json grants the group: $cfg" }
+          if (-not (Test-Path C:\ProgramData\Claimward\helper.sock)) { throw 'no socket' }
+          if (-not (Test-Path 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Claimward VPN.lnk')) { throw 'no shortcut' }
+          if (-not (Test-Path "$env:APPDATA\Claimward\config.json")) { throw 'no app config' }
+
+          # The helper answers, as the app would ask it.
+          go run ./hack/helperping
+          if ($LASTEXITCODE -ne 0) { throw 'the helper does not answer on its socket' }
+
+          # A helper.json somebody else may write stops the helper from starting.
+          Stop-Service ClaimwardHelper
+          $acl = Get-Acl C:\ProgramData\Claimward\helper.json
+          $acl.SetSecurityDescriptorSddlForm('O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)')
+          Set-Acl C:\ProgramData\Claimward\helper.json $acl
+          try { Start-Service ClaimwardHelper; Start-Sleep -Seconds 2 } catch { Write-Host "refused to start, as it must: $_" }
+          if ((Get-Service ClaimwardHelper).Status -eq 'Running') { throw 'the helper started on a helper.json Users may write' }
+          $tail = Get-Content C:\ProgramData\Claimward\helper.log -Tail 3
+          $tail
+          if (-not ($tail -match 'writable by somebody other than SYSTEM or Administrators')) { throw 'the log does not say why the helper refused' }
+
+          & "$env:ProgramFiles\Claimward\uninstall.ps1" -RemoveData
+          if (Get-Service ClaimwardHelper -ErrorAction SilentlyContinue) { throw 'the service survived uninstall' }
+          if (Test-Path "$env:ProgramFiles\Claimward") { throw 'the program folder survived uninstall' }

@@ -105,6 +105,8 @@ creates the local group **Claimward Users** and adds you to it, writes
 **ClaimwardHelper** service, and adds a **Claimward VPN** Start Menu shortcut.
 Group membership takes effect at your **next sign-in to Windows**; until then
 the helper's socket refuses you (the app says the helper is not reachable).
+`-Server` must be an `https` URL, and an existing `C:\ProgramData\Claimward`
+not owned by SYSTEM or Administrators is refused.
 Add other people with `Add-LocalGroupMember -Group 'Claimward Users' -Member <name>`.
 
 `.\uninstall.ps1` removes the service, the shortcut and the programs;
@@ -140,8 +142,8 @@ environment variables); the settings page writes it:
 `provider` is `github` (device flow, the default), `oidc` or `go-authn`; the
 last two take `oidc_issuer` and `oidc_client_id` instead of
 `github_client_id`. `socket_path` overrides the helper's socket. The session
-(tokens and the device's WireGuard key) is kept by `appcore` in
-`%AppData%\claimward\session.json`.
+(tokens and the device's WireGuard key) is kept by `appcore`, sealed with
+DPAPI under `%AppData%\claimward` (see the security notes).
 
 **The helper** reads `C:\ProgramData\Claimward\helper.json`:
 
@@ -183,8 +185,15 @@ to the console.
 - **The browser.** The sign-in page URL comes from the identity provider over
   the network; the app opens it only if it is an `https` URL, since on Windows
   the shell would as well run a program named there.
-- The session file is per-user under `%AppData%`; moving it to the Windows
-  Credential Manager (DPAPI) is future work.
+- **The installer.** `-Server` must be an `https` URL (the bearer token goes to
+  it); anything else is refused before anything is changed. If
+  `C:\ProgramData\Claimward` already exists and is not owned by SYSTEM or
+  Administrators (a local user could have pre-created it, since ProgramData lets
+  every user create directories), or is a link, the installer stops: inspect
+  and remove it, then run the installer again.
+- The session is sealed with DPAPI in a per-user file under `%AppData%`
+  (claimward-vpn-client v0.4.0). `CLAIMWARD_ALLOW_PLAINTEXT_SESSION=1` opts back
+  into the plaintext `session.json`.
 
 These rules are implemented in claimward-vpn-client (`pkg/helper/acl.go`,
 `listen_windows.go`) and tested there, on every OS for the rules and on a

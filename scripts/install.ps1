@@ -55,6 +55,32 @@ $HelperConfig = Join-Path $DataDir 'helper.json'
 $Shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Claimward VPN.lnk'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
 
+# https only: the helper sends the person's bearer token to these servers, and
+# over http anyone on the path could read it. Judged before anything is changed.
+foreach ($s in @($Server)) {
+    if (-not $s) { continue }
+    $u = $null
+    if (-not [Uri]::TryCreate($s, [UriKind]::Absolute, [ref]$u) -or $u.Scheme -ne 'https') {
+        throw "-Server must be an https URL: $s"
+    }
+}
+
+# C:\ProgramData is writable by every user: a directory already at $DataDir may
+# be one a local user pre-created (and so owns, and can re-ACL). Refuse it
+# unless SYSTEM or Administrators own it; the administrator removes it first.
+function Assert-TrustedOwner([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "$Path is a reparse point (link): remove it and run the installer again"
+    }
+    $owner = (Get-Acl -LiteralPath $Path).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    # S-1-5-18 SYSTEM, S-1-5-32-544 Administrators
+    if ($owner -ne 'S-1-5-18' -and $owner -ne 'S-1-5-32-544') {
+        throw "$Path exists and is owned by $owner, not SYSTEM or Administrators: inspect and remove it, then run the installer again"
+    }
+}
+
 function Set-Sddl([string]$Path, [string]$Sddl) {
     $acl = Get-Acl -LiteralPath $Path
     $acl.SetSecurityDescriptorSddlForm($Sddl)
@@ -94,15 +120,11 @@ $groupSid = (Get-LocalGroup -Name $GroupName).SID.Value
 # 3. The helper's directory and configuration. The helper sets the same ACL
 # itself when it starts (owned by SYSTEM then); this makes helper.json safe
 # from the moment it is written.
+Assert-TrustedOwner $DataDir
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+Assert-TrustedOwner $DataDir
 Set-Sddl $DataDir "O:BAG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1200a9;;;$groupSid)"
 if ($Server) {
-    foreach ($s in $Server) {
-        $u = $null
-        if (-not [Uri]::TryCreate($s, [UriKind]::Absolute, [ref]$u) -or ($u.Scheme -ne 'https' -and $u.Scheme -ne 'http')) {
-            throw "not an http(s) URL: $s"
-        }
-    }
     $json = ConvertTo-Json -InputObject @{ servers = @($Server) }
     [System.IO.File]::WriteAllText($HelperConfig, $json, $Utf8NoBom)
     Write-Host "Wrote $HelperConfig"

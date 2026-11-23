@@ -192,8 +192,10 @@ to the console.
   every user create directories), or is a link, the installer stops: inspect
   and remove it, then run the installer again.
 - The session is sealed with DPAPI in a per-user file under `%AppData%`
-  (claimward-vpn-client v0.4.0). `CLAIMWARD_ALLOW_PLAINTEXT_SESSION=1` opts back
-  into the plaintext `session.json`.
+  (claimward-vpn-client v0.5.0). There is no plaintext fallback: if DPAPI
+  fails, sign-in fails with an error saying so, and no session file is written.
+  A `session.json` left by an older version is moved into DPAPI on first start,
+  or deleted if that fails.
 
 These rules are implemented in claimward-vpn-client (`pkg/helper/acl.go`,
 `listen_windows.go`) and tested there, on every OS for the rules and on a

@@ -3,6 +3,7 @@ package scripts
 import (
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -66,11 +67,12 @@ func TestInstallChecksTheOwnerOfTheDataDirectory(t *testing.T) {
 
 // Where Windows PowerShell is present and elevated, run the real refusal.
 func TestInstallRefusesAnHTTPServerWhenRun(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("the script reads Windows environment variables (ProgramFiles) before it can run")
+	}
 	ps, err := exec.LookPath("powershell")
 	if err != nil {
-		if ps, err = exec.LookPath("pwsh"); err != nil {
-			t.Skip("no PowerShell")
-		}
+		t.Skip("no Windows PowerShell")
 	}
 	out, err := exec.Command(ps, "-NoProfile", "-NonInteractive", "-File", "install.ps1", "-Server", "http://vpn.example.com").CombinedOutput()
 	s := string(out)

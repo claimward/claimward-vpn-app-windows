@@ -231,8 +231,28 @@ func (v *View) SystemAppearance(a application.SystemAppearance) {
 	v.dirty.Store(true)
 }
 
+// NativeControls describes the native controls the host embeds: one edit
+// control per text input on the page being shown. It runs on the UI thread, as
+// do the callbacks it returns.
+func (v *View) NativeControls() []toolkit.NativeControl {
+	if v.root == nil {
+		return nil
+	}
+	cs := toolkit.WalkNative(v.root)
+	for i := range cs {
+		if f := cs[i].OnText; f != nil {
+			cs[i].OnText = func(s string) { f(s); v.dirty.Store(true) }
+		}
+		if f := cs[i].OnClaim; f != nil {
+			cs[i].OnClaim = func(b bool) { f(b); v.dirty.Store(true) }
+		}
+	}
+	return cs
+}
+
 var (
-	_ application.Handler        = (*View)(nil)
-	_ application.ShortcutSink   = (*View)(nil)
-	_ application.AppearanceSink = (*View)(nil)
+	_ application.NativeControlProvider = (*View)(nil)
+	_ application.Handler               = (*View)(nil)
+	_ application.ShortcutSink          = (*View)(nil)
+	_ application.AppearanceSink        = (*View)(nil)
 )

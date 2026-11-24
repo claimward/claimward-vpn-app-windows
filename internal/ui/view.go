@@ -47,8 +47,11 @@ type widgets struct {
 
 	serverLabel, providerLabel, githubLabel, issuerLabel, clientLabel, pathLabel *toolkit.Label
 	server, githubID, issuer, clientID                                           *toolkit.Entry
-	provider                                                                     *toolkit.DropDown
-	save, cancel                                                                 *toolkit.Button
+	// The text inputs are native controls (the OS's own edit control, with
+	// its input method); the entries above are their painted fallbacks.
+	nServer, nGitHub, nIssuer, nClient *toolkit.Native
+	provider                           *toolkit.DropDown
+	save, cancel                       *toolkit.Button
 
 	blankSignIn, blankTenant *toolkit.Label
 }
@@ -120,6 +123,10 @@ func bindView(vm *ViewModel, invalidate, relayout func()) (*widgets, *cards, []f
 	w.server.Placeholder = "https://vpn.example.org"
 	w.githubID.Placeholder = "Iv1.0123456789abcdef"
 	w.issuer.Placeholder = "https://login.example.org"
+	w.nServer = nativeEntry("server_url", w.server)
+	w.nGitHub = nativeEntry("github_client_id", w.githubID)
+	w.nIssuer = nativeEntry("oidc_issuer", w.issuer)
+	w.nClient = nativeEntry("oidc_client_id", w.clientID)
 
 	c := &cards{
 		page: &toolkit.CardLayout{}, signIn: &toolkit.CardLayout{},
@@ -158,6 +165,11 @@ func bindView(vm *ViewModel, invalidate, relayout func()) (*widgets, *cards, []f
 		mvvmtk.BindEntryText(w.githubID, vm.GitHubClientID, invalidate),
 		mvvmtk.BindEntryText(w.issuer, vm.OIDCIssuer, invalidate),
 		mvvmtk.BindEntryText(w.clientID, vm.OIDCClientID, invalidate),
+		// The native fields write the same observables the fallbacks read.
+		mvvm.BindTwoWay(vm.ServerURL, w.nServer.Text(), invalidate),
+		mvvm.BindTwoWay(vm.GitHubClientID, w.nGitHub.Text(), invalidate),
+		mvvm.BindTwoWay(vm.OIDCIssuer, w.nIssuer.Text(), invalidate),
+		mvvm.BindTwoWay(vm.OIDCClientID, w.nClient.Text(), invalidate),
 
 		mvvm.OneWay(vm.Page, &c.page.Active, onCard),
 		mvvm.OneWay(vm.SignInPanel, &c.signIn.Active, onCard),
@@ -165,6 +177,15 @@ func bindView(vm *ViewModel, invalidate, relayout func()) (*widgets, *cards, []f
 		mvvm.OneWay(vm.ProviderPanel, &c.provider.Active, onCard),
 	}
 	return w, c, unbind
+}
+
+// nativeEntry is a native single-line text field keyed by its configuration
+// key, painting fallback where no host claims it.
+func nativeEntry(key string, fallback *toolkit.Entry) *toolkit.Native {
+	n := toolkit.NewNativeEntry("")
+	n.Key = key
+	n.Fallback = fallback
+	return n
 }
 
 func providerLabels() []string {
@@ -226,18 +247,18 @@ func layout(w *widgets, c *cards) toolkit.Widget {
 	github := toolkit.NewVBox()
 	github.Spacing = px(4)
 	github.AddFixed(w.githubLabel, px(rowH))
-	github.AddFixed(w.githubID, px(rowH))
+	github.AddFixed(w.nGitHub, px(rowH))
 	oidc := toolkit.NewVBox()
 	oidc.Spacing = px(4)
 	oidc.AddFixed(w.issuerLabel, px(rowH))
-	oidc.AddFixed(w.issuer, px(rowH))
+	oidc.AddFixed(w.nIssuer, px(rowH))
 	oidc.AddFixed(w.clientLabel, px(rowH))
-	oidc.AddFixed(w.clientID, px(rowH))
+	oidc.AddFixed(w.nClient, px(rowH))
 
 	settings := toolkit.NewVBox()
 	settings.Spacing = px(4)
 	settings.AddFixed(w.serverLabel, px(rowH))
-	settings.AddFixed(w.server, px(rowH))
+	settings.AddFixed(w.nServer, px(rowH))
 	settings.AddFixed(w.providerLabel, px(rowH))
 	settings.AddFixed(w.provider, px(rowH))
 	settings.AddFixed(card(c.provider, github, oidc), 4*px(rowH)+3*px(4))

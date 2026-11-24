@@ -14,6 +14,12 @@ HTTP server in the app. The tunnel is [wireguard-go](https://git.zx2c4.com/wireg
 on a [Wintun](https://www.wintun.net) adapter, configured through the IP Helper
 API.
 
+The four settings text fields are **native Win32 Edit controls** embedded in the
+window, so the system's input method editors (IME), selection and clipboard work
+as in any Windows app; the painted entry stays as the fallback. The native
+fields have no placeholder text. The Win32 host is cross-compiled and unit
+tested from macOS; it has not been run on a Windows machine yet.
+
 It is the Windows sibling of
 [claimward-vpn-app-osx](https://github.com/claimward/claimward-vpn-app-osx);
 both are thin shells over the shared core in

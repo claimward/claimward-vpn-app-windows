@@ -24,12 +24,6 @@ var (
 	ourPID            = uint32(os.Getpid())
 )
 
-// openURL opens an https URL (the ViewModel refuses any other) in the
-// default browser through the shell.
-func openURL(u string) error {
-	return windows.ShellExecute(0, windows.StringToUTF16Ptr("open"), windows.StringToUTF16Ptr(u), nil, nil, windows.SW_SHOWNORMAL)
-}
-
 // ourWindow is this process's top-level window with the given title. It is
 // looked up by process as well as by title, so another program's window of
 // the same name is never touched.

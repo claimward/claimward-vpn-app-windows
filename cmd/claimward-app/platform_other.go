@@ -4,13 +4,7 @@
 
 package main
 
-import (
-	"os"
-
-	"github.com/claimward/claimward-vpn-client/pkg/browser"
-)
-
-func openURL(u string) error { return browser.Open(u) }
+import "os"
 
 // raiseWindow has no portable way to bring a window forward; the window is
 // already open, since closing it quits.

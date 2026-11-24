@@ -70,6 +70,12 @@ type View struct {
 	theme       *toolkit.Theme
 	buf         []byte
 	width, high int
+	// spare is where the next frame is painted; repaint says the next one has
+	// no usable previous frame, damageAll that the whole of it is to be
+	// reported, and damage is what changed since DamageRects was last called.
+	spare              []byte
+	repaint, damageAll bool
+	damage             []toolkit.Rect
 	// builtAt is the metric scale the boxes were sized for.
 	builtAt float64
 
@@ -81,7 +87,7 @@ type View struct {
 }
 
 // NewView binds a View to vm. Its Frame drains queue: give the ViewModel
-// WithDispatch(spawn, queue.Post).
+// WithPost(queue.Post).
 func NewView(vm *ViewModel, queue *Queue) *View {
 	v := &View{vm: vm, queue: queue, theme: toolkit.DefaultLight()}
 	invalidate := func() { v.dirty.Store(true) }
@@ -106,6 +112,7 @@ func (v *View) Resize(w, h int, _ float64) {
 	}
 	v.width, v.high = w, h
 	v.buf = make([]byte, 4*w*h)
+	v.repaint = true
 	v.relayout.Store(true)
 	v.dirty.Store(true)
 }
@@ -133,13 +140,39 @@ func (v *View) Frame() ([]byte, int, int, bool) {
 	if !v.dirty.Swap(false) {
 		return v.buf, v.width, v.high, false
 	}
-	bg := v.theme.Background
-	for i := 0; i+3 < len(v.buf); i += 4 {
-		v.buf[i], v.buf[i+1], v.buf[i+2], v.buf[i+3] = bg.R, bg.G, bg.B, bg.A
+	// Paint into the spare buffer, then diff it against the frame the host
+	// last received and swap: the changed rectangles cost one scan, no copy.
+	if len(v.spare) != len(v.buf) {
+		v.spare = make([]byte, len(v.buf))
+		v.repaint = true
 	}
-	p := painter.NewPixelPainter(v.buf, v.width, v.high)
+	bg := v.theme.Background
+	for i := 0; i+3 < len(v.spare); i += 4 {
+		v.spare[i], v.spare[i+1], v.spare[i+2], v.spare[i+3] = bg.R, bg.G, bg.B, bg.A
+	}
+	p := painter.NewPixelPainter(v.spare, v.width, v.high)
 	v.root.Draw(p, v.theme)
+	if v.repaint {
+		v.damageAll, v.repaint = true, false
+	} else {
+		v.damage = append(v.damage, toolkit.DiffRects(v.spare, v.buf, v.width, v.high)...)
+	}
+	v.buf, v.spare = v.spare, v.buf
 	return v.buf, v.width, v.high, true
+}
+
+// DamageRects reports the rectangles, in framebuffer pixels, that changed
+// since the last call: what the window has to re-present instead of the whole
+// frame. It reports nothing (the whole frame) after a resize, and whenever no
+// painted frame is pending, so a host that presents for any other reason, an
+// expose for one, repaints everything and is never left with stale pixels.
+func (v *View) DamageRects() []toolkit.Rect {
+	out := v.damage
+	if v.damageAll {
+		out = nil
+	}
+	v.damage, v.damageAll = nil, false
+	return out
 }
 
 // NeedsPresent, PresentImmediate and PresentThrottle let the window skip

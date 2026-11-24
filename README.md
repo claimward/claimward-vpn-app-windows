@@ -191,6 +191,9 @@ to the console.
   Administrators (a local user could have pre-created it, since ProgramData lets
   every user create directories), or is a link, the installer stops: inspect
   and remove it, then run the installer again.
+- The adapter's MTU is clamped to the path MTU to the server minus 60 (IPv4) or
+  80 (IPv6) (claimward-vpn-client v0.6.0), so large packets are not lost on
+  links with a smaller MTU.
 - The session is sealed with DPAPI in a per-user file under `%AppData%`
   (claimward-vpn-client v0.5.0). There is no plaintext fallback: if DPAPI
   fails, sign-in fails with an error saying so, and no session file is written.

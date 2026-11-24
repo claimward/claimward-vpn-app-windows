@@ -432,7 +432,12 @@ func TestSettings(t *testing.T) {
 		t.Fatalf("form: page %d %q %d %q %q panel %d", vm.Page.Get(), vm.ServerURL.Get(), vm.ProviderIndex.Get(), vm.OIDCIssuer.Get(), vm.OIDCClientID.Get(), vm.ProviderPanel.Get())
 	}
 	// Opening them again, from the settings page, changes nothing.
+	vm.ServerURL.Set("https://typed.example.org")
 	vm.openSettings()
+	if vm.ServerURL.Get() != "https://typed.example.org" {
+		t.Error("a refused open overwrote what was typed")
+	}
+	vm.ServerURL.Set("https://old.example.org")
 	if vm.Page.Get() != PageSettings || vm.OpenSettings.CanExecute() {
 		t.Error("the settings page offers to open itself")
 	}

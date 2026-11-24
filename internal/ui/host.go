@@ -235,9 +235,6 @@ func (v *View) SystemAppearance(a application.SystemAppearance) {
 // control per text input on the page being shown. It runs on the UI thread, as
 // do the callbacks it returns.
 func (v *View) NativeControls() []toolkit.NativeControl {
-	if v.root == nil {
-		return nil
-	}
 	cs := toolkit.WalkNative(v.root)
 	for i := range cs {
 		if f := cs[i].OnText; f != nil {

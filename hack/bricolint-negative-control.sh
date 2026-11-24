@@ -33,7 +33,7 @@ bricolint="${BRICOLINT:-$(go env GOPATH)/bin/bricolint}"
 # so it lands inside Frame() with `p` in scope and statically typed as
 # *painter.PixelPainter — the receiver bricolint resolves to go-widgets/painter.
 target="$root/internal/ui/host.go"
-anchor='p := painter.NewPixelPainter(v.spare, v.width, v.high)'
+anchor='p := painter.NewPixelPainter(v.buf, v.width, v.high)'
 marker='//bricolint-negative-control-injection'
 inject="	p.FillRect(painter.Rect{}, painter.RGBA{}) ${marker}"
 

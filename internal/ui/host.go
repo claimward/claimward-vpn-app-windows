@@ -58,6 +58,10 @@ func (q *Queue) Drain() {
 // for the whole process; on failure the bitmap face stays.
 func UseOpenTypeText() error { return toolkit.UseOpenTypeText() }
 
+// designW and designH are the window the layout is drawn for, in logical
+// pixels: the size the application opens at.
+const designW, designH = 460, 720
+
 // View is the window: the bound widgets, laid out, as an
 // application.Handler.
 type View struct {
@@ -70,12 +74,20 @@ type View struct {
 	theme       *toolkit.Theme
 	buf         []byte
 	width, high int
-	// spare is where the next frame is painted; repaint says the next one has
-	// no usable previous frame, damageAll that the whole of it is to be
-	// reported, and damage is what changed since DamageRects was last called.
-	spare              []byte
-	repaint, damageAll bool
-	damage             []toolkit.Rect
+	// repaint says the next frame is whole and damageAll that the whole of it
+	// is to be reported. What changed is reported by whoever changed it, not
+	// found by scanning pixels: the widgets whose state moved since the last
+	// frame, the rectangles painted and not yet reported (damage, and the spare
+	// slice it trades places with), the floating popovers drawn in the last
+	// frame, the widgets a hover can repaint, and the pointer's last position.
+	repaint, damageAll   bool
+	touched, interactive []toolkit.Widget
+	damage, spareDamage  []toolkit.Rect
+	popovers, prevPops   []toolkit.Rect
+	left                 []toolkit.Rect // what the cards' pages just left had drawn
+	switched             [4]bool        // the card changed page since the last frame
+	hoverX, hoverY       int
+	hoverStale           bool // widgets moved since the pointer was last seen
 	// builtAt is the metric scale the boxes were sized for.
 	builtAt float64
 
@@ -90,11 +102,52 @@ type View struct {
 // WithPost(queue.Post).
 func NewView(vm *ViewModel, queue *Queue) *View {
 	v := &View{vm: vm, queue: queue, theme: toolkit.DefaultLight()}
-	invalidate := func() { v.dirty.Store(true) }
-	relayout := func() { v.relayout.Store(true) }
-	v.w, v.cards, v.unbind = bindView(vm, invalidate, relayout)
+	v.w, v.cards, v.unbind = bindView(vm, v.changed, v.cardChanged)
+	v.interactive = v.w.interactive()
 	v.dirty.Store(true)
 	return v
+}
+
+// changed is the invalidation of a binder whose state reached ws: the next
+// frame reports their rectangles, and only those, as damaged.
+func (v *View) changed(ws ...toolkit.Widget) func() {
+	return func() {
+		v.touched = append(v.touched, ws...)
+		v.dirty.Store(true)
+	}
+}
+
+// cardChanged is the invalidation of card i switching page: what its pages
+// drew until now is damaged, and so, once laid out again, is what they draw.
+func (v *View) cardChanged(i int) func() {
+	return func() {
+		for _, p := range v.cards.pages[i] {
+			v.left = append(v.left, extent(p))
+		}
+		v.switched[i], v.hoverStale = true, true
+		v.relayout.Store(true)
+		v.dirty.Store(true)
+	}
+}
+
+// everything makes the next frame whole: a change nothing here can bound.
+func (v *View) everything() {
+	v.repaint = true
+	v.dirty.Store(true)
+}
+
+// hovered marks the interactive widgets under (x, y), whose hover feedback a
+// pointer move there changes.
+// (x, y) is in framebuffer pixels; the toolkit is handed it relative to the
+// root, so a widget is taken as under the pointer in either frame of reference.
+func (v *View) hovered(x, y int) {
+	r := v.root.Bounds()
+	for _, w := range v.interactive {
+		if b := w.Bounds(); b.Contains(x, y) || b.Contains(x-r.X, y-r.Y) {
+			v.touched = append(v.touched, w)
+			v.dirty.Store(true)
+		}
+	}
 }
 
 // Close releases the bindings.
@@ -112,7 +165,7 @@ func (v *View) Resize(w, h int, _ float64) {
 	}
 	v.width, v.high = w, h
 	v.buf = make([]byte, 4*w*h)
-	v.repaint = true
+	v.repaint, v.hoverStale = true, true
 	v.relayout.Store(true)
 	v.dirty.Store(true)
 }
@@ -122,6 +175,7 @@ func (v *View) Resize(w, h int, _ float64) {
 func (v *View) arrange() {
 	if s := toolkit.MetricScale(); v.root == nil || s != v.builtAt {
 		v.root, v.builtAt = layout(v.w, v.cards), s
+		v.repaint = true
 	}
 	m := toolkit.Scaled(margin)
 	v.root.SetBounds(toolkit.Rect{X: m, Y: m, W: v.width - 2*m, H: v.high - 2*m})
@@ -140,38 +194,112 @@ func (v *View) Frame() ([]byte, int, int, bool) {
 	if !v.dirty.Swap(false) {
 		return v.buf, v.width, v.high, false
 	}
-	// Paint into the spare buffer, then diff it against the frame the host
-	// last received and swap: the changed rectangles cost one scan, no copy.
-	if len(v.spare) != len(v.buf) {
-		v.spare = make([]byte, len(v.buf))
+	bg := v.theme.Background
+	for i := 0; i+3 < len(v.buf); i += 4 {
+		v.buf[i], v.buf[i+1], v.buf[i+2], v.buf[i+3] = bg.R, bg.G, bg.B, bg.A
+	}
+	p := painter.NewPixelPainter(v.buf, v.width, v.high)
+	v.root.Draw(p, v.theme)
+	v.collectDamage()
+	return v.buf, v.width, v.high, true
+}
+
+// collectDamage turns what the binders and events reported into rectangles,
+// now that the layout they sit in is the one just painted. A popover floats
+// outside its widget, so the ones drawn now and the ones drawn last frame are
+// both damaged: it covers pixels it did not cover before, or uncovers them.
+func (v *View) collectDamage() {
+	pops := v.popovers[:0]
+	for _, o := range toolkit.PopoverOwners(v.root) {
+		pops = append(pops, o.PopoverBounds())
+	}
+	// The widgets report what they changed within their own rectangles, and
+	// that holds in the window the layout is drawn for. Below its size a
+	// control squeezed past its content draws outside itself, which no
+	// rectangle bounds, so such a window is repainted whole.
+	if v.width < toolkit.Scaled(designW) || v.high < toolkit.Scaled(designH) {
 		v.repaint = true
 	}
-	bg := v.theme.Background
-	for i := 0; i+3 < len(v.spare); i += 4 {
-		v.spare[i], v.spare[i+1], v.spare[i+2], v.spare[i+3] = bg.R, bg.G, bg.B, bg.A
-	}
-	p := painter.NewPixelPainter(v.spare, v.width, v.high)
-	v.root.Draw(p, v.theme)
 	if v.repaint {
 		v.damageAll, v.repaint = true, false
-	} else {
-		v.damage = append(v.damage, toolkit.DiffRects(v.spare, v.buf, v.width, v.high)...)
 	}
-	v.buf, v.spare = v.spare, v.buf
-	return v.buf, v.width, v.high, true
+	if !v.damageAll {
+		for _, w := range v.touched {
+			v.addDamage(w.Bounds())
+		}
+		for _, r := range pops {
+			v.addDamage(r)
+		}
+		for _, r := range v.prevPops {
+			v.addDamage(r)
+		}
+		for i, cl := range v.cards.layouts() {
+			if a, pages := cl.Active, v.cards.pages[i]; v.switched[i] && a >= 0 && a < len(pages) {
+				v.addDamage(extent(pages[a]))
+			}
+		}
+		for _, r := range v.left {
+			v.addDamage(r)
+		}
+	}
+	v.switched = [4]bool{}
+	v.left = v.left[:0]
+	clear(v.touched) // drop the widget references, keep the room
+	v.touched = v.touched[:0]
+	v.popovers, v.prevPops = v.prevPops[:0], pops
+}
+
+// extent is the rectangle w and everything under it occupies: a box lays its
+// children out in more room than it has when the window is short, and they
+// draw there.
+func extent(w toolkit.Widget) toolkit.Rect {
+	r := w.Bounds()
+	if cp, ok := w.(interface{ Children() []toolkit.Widget }); ok {
+		for _, c := range cp.Children() {
+			r = union(r, extent(c))
+		}
+	}
+	return r
+}
+
+// union is the smallest rectangle holding a and b; an empty one is ignored.
+func union(a, b toolkit.Rect) toolkit.Rect {
+	switch {
+	case a.W <= 0 || a.H <= 0:
+		return b
+	case b.W <= 0 || b.H <= 0:
+		return a
+	}
+	x0, y0 := min(a.X, b.X), min(a.Y, b.Y)
+	x1, y1 := max(a.X+a.W, b.X+b.W), max(a.Y+a.H, b.Y+b.H)
+	return toolkit.Rect{X: x0, Y: y0, W: x1 - x0, H: y1 - y0}
+}
+
+// addDamage records r, cut to the frame: a widget can sit partly or wholly
+// outside it, and a host copies exactly the rectangles it is given.
+func (v *View) addDamage(r toolkit.Rect) {
+	x0, y0 := max(r.X, 0), max(r.Y, 0)
+	x1, y1 := min(r.X+r.W, v.width), min(r.Y+r.H, v.high)
+	if x1 > x0 && y1 > y0 {
+		v.damage = append(v.damage, toolkit.Rect{X: x0, Y: y0, W: x1 - x0, H: y1 - y0})
+	}
 }
 
 // DamageRects reports the rectangles, in framebuffer pixels, that changed
 // since the last call: what the window has to re-present instead of the whole
-// frame. It reports nothing (the whole frame) after a resize, and whenever no
-// painted frame is pending, so a host that presents for any other reason, an
-// expose for one, repaints everything and is never left with stale pixels.
+// frame. They come from what changed (the widgets whose state moved, the
+// widget under a hovering pointer), not from comparing pixels. It reports
+// nothing (the whole frame) after a resize, a theme change or an input the
+// view cannot bound, and whenever no painted frame is pending, so a host that
+// presents for any other reason, an expose for one, repaints everything and is
+// never left with stale pixels. The slice is valid until the next call.
 func (v *View) DamageRects() []toolkit.Rect {
 	out := v.damage
-	if v.damageAll {
+	if v.damageAll || len(out) == 0 {
 		out = nil
 	}
-	v.damage, v.damageAll = nil, false
+	v.damage, v.spareDamage = v.spareDamage[:0], v.damage // two slices trade places: no allocation per frame
+	v.damageAll = false
 	return out
 }
 
@@ -190,7 +318,28 @@ func (v *View) event(ev toolkit.Event) {
 	ev.X -= r.X
 	ev.Y -= r.Y
 	v.root.OnEvent(ev)
-	v.dirty.Store(true)
+	if ev.Kind == toolkit.EventMouseMove && !v.pressed {
+		// A hover repaints the widget the pointer left and the one it entered,
+		// and a popover list highlights the row under it. Where the widgets have
+		// moved since the pointer was last seen (a resize, a page change), a
+		// hover flag kept where one used to be flips wherever that widget is
+		// now, so every one that can hover is repainted once.
+		if v.hoverStale {
+			v.touched = append(v.touched, v.interactive...)
+			v.hoverStale = false
+		}
+		v.hovered(v.hoverX, v.hoverY)
+		v.hovered(ev.X+r.X, ev.Y+r.Y)
+		v.dirty.Store(true)
+	} else {
+		// A press moves focus, a key edits or moves it, a wheel scrolls, a drag
+		// selects: nothing here says where, so the frame is whole. Nor where a
+		// button now believes the pointer is: a press, a drag and a release set
+		// that without a plain move.
+		v.everything()
+		v.hoverStale = true
+	}
+	v.hoverX, v.hoverY = ev.X+r.X, ev.Y+r.Y
 }
 
 // MouseDown is a click: the toolkit acts on the press.
@@ -261,7 +410,7 @@ func (v *View) SystemAppearance(a application.SystemAppearance) {
 	} else {
 		v.theme = toolkit.DefaultLight()
 	}
-	v.dirty.Store(true)
+	v.everything()
 }
 
 // NativeControls describes the native controls the host embeds: one edit
@@ -271,10 +420,10 @@ func (v *View) NativeControls() []toolkit.NativeControl {
 	cs := toolkit.WalkNative(v.root)
 	for i := range cs {
 		if f := cs[i].OnText; f != nil {
-			cs[i].OnText = func(s string) { f(s); v.dirty.Store(true) }
+			cs[i].OnText = func(s string) { f(s); v.everything() }
 		}
 		if f := cs[i].OnClaim; f != nil {
-			cs[i].OnClaim = func(b bool) { f(b); v.dirty.Store(true) }
+			cs[i].OnClaim = func(b bool) { f(b); v.everything() }
 		}
 	}
 	return cs

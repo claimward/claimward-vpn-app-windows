@@ -4,7 +4,7 @@ go 1.27.4
 
 require (
 	github.com/claimward/claimward-vpn-client v0.7.0
-	github.com/go-widgets/application v0.9.0
+	github.com/go-widgets/application v0.10.0
 	github.com/go-widgets/mvvm v0.15.0
 	github.com/go-widgets/mvvmtk v0.16.0
 	github.com/go-widgets/painter v0.18.0

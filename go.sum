@@ -55,8 +55,8 @@ github.com/go-typeset/bidi v0.3.1 h1:fsTa0b9txt2SkH7M55EZ06+q3N9C4O0Oerf+SPLLGFs
 github.com/go-typeset/bidi v0.3.1/go.mod h1:ct3cmYT8Qt1FGJQ+2QaakrUxqaP4ZysgdQQg2ym5+Xo=
 github.com/go-widgets/android v0.16.0 h1:XZcVp5c67B4mDHF6g3kccg1gCWiHjCUltR2jECnXBy0=
 github.com/go-widgets/android v0.16.0/go.mod h1:jgUuRKxDTGIGpgzb5rnImlfYZLZBai32v8WPwXSwxOo=
-github.com/go-widgets/application v0.9.0 h1:PnFk1XPYYSiycYhRY4YCmSBhLJfg4CdBiINKcLCGgYY=
-github.com/go-widgets/application v0.9.0/go.mod h1:aSvZt/bBkDOJm8OpiOPamvPykZR3/2HFrA03D1oAr04=
+github.com/go-widgets/application v0.10.0 h1:DFT0T75lFPSjPOY4/Mlm3pj7uHbyePXqzxJjWY3PKSA=
+github.com/go-widgets/application v0.10.0/go.mod h1:aSvZt/bBkDOJm8OpiOPamvPykZR3/2HFrA03D1oAr04=
 github.com/go-widgets/gpupainter v0.4.0 h1:0vCn1fdCmKzY9HvA7ZIvuShTaMez/4J1boFmoPIwfyc=
 github.com/go-widgets/gpupainter v0.4.0/go.mod h1:FsiQjTB+EbxOprUMPqExALrzSyrNta3wTKbpA8dbfUM=
 github.com/go-widgets/mvvm v0.15.0 h1:VvZiLB7gm+5CIEeQH3GNI53ytUndzOznT/fJvaG8hOQ=

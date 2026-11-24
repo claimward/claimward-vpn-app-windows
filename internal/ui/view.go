@@ -69,11 +69,20 @@ type widgets struct {
 // walk, so the switch would change nothing the user can see.
 type cards struct {
 	page, signIn, tenant, provider *toolkit.CardLayout
+	// pages are what each card switches between, in the order of its Active,
+	// filled in by layout: the damage of a switch is the extent of them.
+	pages [4][]toolkit.Widget
 }
 
-// bindView builds the widgets and binds them; invalidate asks for a repaint
-// and relayout asks for the cards to be laid out again.
-func bindView(vm *ViewModel, invalidate, relayout func()) (*widgets, *cards, []func()) {
+// layouts lists the cards in the order their switches are numbered.
+func (c *cards) layouts() [4]*toolkit.CardLayout {
+	return [4]*toolkit.CardLayout{c.page, c.signIn, c.tenant, c.provider}
+}
+
+// bindView builds the widgets and binds them. on(ws...) is the invalidation of
+// a binder whose state reaches the widgets ws, and only them; onCard(i) is the
+// one of card i (see cards.layouts), which also asks for a new layout.
+func bindView(vm *ViewModel, on func(...toolkit.Widget) func(), onCard func(int) func()) (*widgets, *cards, []func()) {
 	w := &widgets{
 		title:   toolkit.NewLabel("Claimward VPN"),
 		state:   toolkit.NewLabel(""),
@@ -132,51 +141,59 @@ func bindView(vm *ViewModel, invalidate, relayout func()) (*widgets, *cards, []f
 		page: &toolkit.CardLayout{}, signIn: &toolkit.CardLayout{},
 		tenant: &toolkit.CardLayout{}, provider: &toolkit.CardLayout{},
 	}
-	onCard := func() { relayout(); invalidate() }
 	unbind := []func(){
-		mvvmtk.BindLabel(w.state, vm.State, invalidate),
-		mvvmtk.BindLabel(w.detail, vm.Detail, invalidate),
-		mvvmtk.BindLabel(w.account, vm.Account, invalidate),
-		mvvmtk.BindLabel(w.tenant, vm.Tenant, invalidate),
-		mvvmtk.BindLabel(w.helper, vm.Helper, invalidate),
-		mvvmtk.BindLabel(w.busy, vm.Busy, invalidate),
-		mvvmtk.BindLabel(w.message, vm.Message, invalidate),
-		mvvmtk.BindLabel(w.deviceCode, vm.DeviceCode, invalidate),
-		mvvmtk.BindLabel(w.deviceURI, vm.DeviceURI, invalidate),
-		mvvmtk.BindLabel(w.pathLabel, vm.ConfigPath, invalidate),
+		mvvmtk.BindLabel(w.state, vm.State, on(w.state)),
+		mvvmtk.BindLabel(w.detail, vm.Detail, on(w.detail)),
+		mvvmtk.BindLabel(w.account, vm.Account, on(w.account)),
+		mvvmtk.BindLabel(w.tenant, vm.Tenant, on(w.tenant)),
+		mvvmtk.BindLabel(w.helper, vm.Helper, on(w.helper)),
+		mvvmtk.BindLabel(w.busy, vm.Busy, on(w.busy)),
+		mvvmtk.BindLabel(w.message, vm.Message, on(w.message)),
+		mvvmtk.BindLabel(w.deviceCode, vm.DeviceCode, on(w.deviceCode)),
+		mvvmtk.BindLabel(w.deviceURI, vm.DeviceURI, on(w.deviceURI)),
+		mvvmtk.BindLabel(w.pathLabel, vm.ConfigPath, on(w.pathLabel)),
 
-		mvvmtk.BindCommand(w.settings, vm.OpenSettings, invalidate),
-		mvvmtk.BindCommand(w.openPage, vm.OpenSignInPage, invalidate),
-		mvvmtk.BindCommand(w.cancelSignIn, vm.CancelSignIn, invalidate),
-		mvvmtk.BindCommand(w.signIn, vm.SignIn, invalidate),
-		mvvmtk.BindCommand(w.signOut, vm.SignOut, invalidate),
-		mvvmtk.BindCommand(w.connect, vm.Connect, invalidate),
-		mvvmtk.BindCommand(w.disconnect, vm.Disconnect, invalidate),
-		mvvmtk.BindCommand(w.chooseTenant, vm.ChooseTenant, invalidate),
-		mvvmtk.BindCommand(w.save, vm.SaveSettings, invalidate),
-		mvvmtk.BindCommand(w.cancel, vm.CloseSettings, invalidate),
+		mvvmtk.BindCommand(w.settings, vm.OpenSettings, on(w.settings)),
+		mvvmtk.BindCommand(w.openPage, vm.OpenSignInPage, on(w.openPage)),
+		mvvmtk.BindCommand(w.cancelSignIn, vm.CancelSignIn, on(w.cancelSignIn)),
+		mvvmtk.BindCommand(w.signIn, vm.SignIn, on(w.signIn)),
+		mvvmtk.BindCommand(w.signOut, vm.SignOut, on(w.signOut)),
+		mvvmtk.BindCommand(w.connect, vm.Connect, on(w.connect)),
+		mvvmtk.BindCommand(w.disconnect, vm.Disconnect, on(w.disconnect)),
+		mvvmtk.BindCommand(w.chooseTenant, vm.ChooseTenant, on(w.chooseTenant)),
+		mvvmtk.BindCommand(w.save, vm.SaveSettings, on(w.save)),
+		mvvmtk.BindCommand(w.cancel, vm.CloseSettings, on(w.cancel)),
 
-		mvvmtk.BindDropDownOptions(w.tenantPick, vm.TenantNames, func(s string) string { return s }, invalidate),
-		mvvmtk.BindSelectedIndex(w.tenantPick, vm.TenantIndex, invalidate),
-		mvvmtk.BindSelectedIndex(w.provider, vm.ProviderIndex, invalidate),
-		mvvmtk.BindListItems(w.log, vm.Log, func(s string) string { return s }, invalidate),
+		mvvmtk.BindDropDownOptions(w.tenantPick, vm.TenantNames, func(s string) string { return s }, on(w.tenantPick)),
+		mvvmtk.BindSelectedIndex(w.tenantPick, vm.TenantIndex, on(w.tenantPick)),
+		mvvmtk.BindSelectedIndex(w.provider, vm.ProviderIndex, on(w.provider)),
+		mvvmtk.BindListItems(w.log, vm.Log, func(s string) string { return s }, on(w.log)),
 
-		mvvmtk.BindEntryText(w.server, vm.ServerURL, invalidate),
-		mvvmtk.BindEntryText(w.githubID, vm.GitHubClientID, invalidate),
-		mvvmtk.BindEntryText(w.issuer, vm.OIDCIssuer, invalidate),
-		mvvmtk.BindEntryText(w.clientID, vm.OIDCClientID, invalidate),
+		mvvmtk.BindEntryText(w.server, vm.ServerURL, on(w.nServer)),
+		mvvmtk.BindEntryText(w.githubID, vm.GitHubClientID, on(w.nGitHub)),
+		mvvmtk.BindEntryText(w.issuer, vm.OIDCIssuer, on(w.nIssuer)),
+		mvvmtk.BindEntryText(w.clientID, vm.OIDCClientID, on(w.nClient)),
 		// The native fields write the same observables the fallbacks read.
-		mvvm.BindTwoWay(vm.ServerURL, w.nServer.Text(), invalidate),
-		mvvm.BindTwoWay(vm.GitHubClientID, w.nGitHub.Text(), invalidate),
-		mvvm.BindTwoWay(vm.OIDCIssuer, w.nIssuer.Text(), invalidate),
-		mvvm.BindTwoWay(vm.OIDCClientID, w.nClient.Text(), invalidate),
+		mvvm.BindTwoWay(vm.ServerURL, w.nServer.Text(), on(w.nServer)),
+		mvvm.BindTwoWay(vm.GitHubClientID, w.nGitHub.Text(), on(w.nGitHub)),
+		mvvm.BindTwoWay(vm.OIDCIssuer, w.nIssuer.Text(), on(w.nIssuer)),
+		mvvm.BindTwoWay(vm.OIDCClientID, w.nClient.Text(), on(w.nClient)),
 
-		mvvm.OneWay(vm.Page, &c.page.Active, onCard),
-		mvvm.OneWay(vm.SignInPanel, &c.signIn.Active, onCard),
-		mvvm.OneWay(vm.TenantPanel, &c.tenant.Active, onCard),
-		mvvm.OneWay(vm.ProviderPanel, &c.provider.Active, onCard),
+		mvvm.OneWay(vm.Page, &c.page.Active, onCard(0)),
+		mvvm.OneWay(vm.SignInPanel, &c.signIn.Active, onCard(1)),
+		mvvm.OneWay(vm.TenantPanel, &c.tenant.Active, onCard(2)),
+		mvvm.OneWay(vm.ProviderPanel, &c.provider.Active, onCard(3)),
 	}
 	return w, c, unbind
+}
+
+// interactive are the widgets that draw hover feedback.
+func (w *widgets) interactive() []toolkit.Widget {
+	return []toolkit.Widget{
+		w.settings, w.openPage, w.cancelSignIn, w.signIn, w.signOut, w.connect,
+		w.disconnect, w.chooseTenant, w.save, w.cancel, w.tenantPick, w.provider,
+		w.log, w.nServer, w.nGitHub, w.nIssuer, w.nClient,
+	}
 }
 
 // nativeEntry is a native single-line text field keyed by its configuration
@@ -214,6 +231,11 @@ func layout(w *widgets, c *cards) toolkit.Widget {
 		ct := toolkit.NewContainer(l)
 		for _, p := range pages {
 			ct.AddWidget(p)
+		}
+		for i, cl := range c.layouts() {
+			if cl == l {
+				c.pages[i] = pages
+			}
 		}
 		return ct
 	}

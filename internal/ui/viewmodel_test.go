@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
+//
+// The ViewModel is an adapter over appvm (claimward-vpn-client pkg/appvm,
+// tested there): these tests check what the adapter does -- every State is
+// copied into the observables, every command reaches the model -- over a fake
+// Core, with the results carried to the "UI thread" through a Queue.
 
 package ui
 
@@ -25,13 +30,13 @@ type fakeCore struct {
 	offered []hproto.Tenant
 
 	loginErr, connectErr, tenantsErr, setTenantErr, updateErr, disconnectErr, logoutErr error
-	// loginWait, when set, makes Login wait for it or for its context.
-	loginWait chan struct{}
+	// loginWait, when set, makes Login wait for it or for its context;
+	// connectWait does the same for Connect.
+	loginWait, connectWait chan struct{}
 
 	calls     []string
 	setTenant []string
 	saved     []appcore.Config
-	statuses  int
 }
 
 func (f *fakeCore) call(name string) {
@@ -43,7 +48,6 @@ func (f *fakeCore) call(name string) {
 func (f *fakeCore) Status() appcore.Status {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.statuses++
 	return f.st
 }
 
@@ -111,8 +115,15 @@ func (f *fakeCore) SetTenant(id string) error {
 
 // Connect refuses a person in several tenants who chose none, as the
 // server and appcore do, offering the tenants.
-func (f *fakeCore) Connect(context.Context) error {
+func (f *fakeCore) Connect(ctx context.Context) error {
 	f.call("Connect")
+	if f.connectWait != nil {
+		select {
+		case <-f.connectWait:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.connectErr != nil {
@@ -176,545 +187,359 @@ func signedIn() *fakeCore {
 	return f
 }
 
-// newVM is a ViewModel whose work runs inline, refreshed once.
-func newVM(t *testing.T, f *fakeCore, opts ...Option) *ViewModel {
+// newVM is a ViewModel over f whose results come back through q, refreshed
+// once.
+func newVM(t *testing.T, f *fakeCore, opts ...Option) (*ViewModel, *Queue) {
 	t.Helper()
-	vm := NewViewModel(f, opts...)
+	q := &Queue{}
+	vm := NewViewModel(f, append([]Option{WithPost(q.Post)}, opts...)...)
+	t.Cleanup(func() { vm.Stop(); vm.Wait() })
 	vm.Refresh()
-	return vm
+	q.Drain()
+	return vm, q
 }
 
-type commandState map[string]bool
+// settle waits for every action to finish and runs what they posted.
+func settle(vm *ViewModel, q *Queue) {
+	vm.Wait()
+	q.Drain()
+}
 
-func commands(vm *ViewModel) commandState {
-	return commandState{
-		"SignIn": vm.SignIn.CanExecute(), "Connect": vm.Connect.CanExecute(), "Disconnect": vm.Disconnect.CanExecute(),
-		"SignOut": vm.SignOut.CanExecute(), "ChooseTenant": vm.ChooseTenant.CanExecute(),
-	}
+// run executes a command and settles.
+func run(vm *ViewModel, q *Queue, execute func()) {
+	execute()
+	settle(vm, q)
 }
 
 func TestStatusLines(t *testing.T) {
 	f := signedOut()
 	vm := NewViewModel(f)
-	if vm.State.Get() != "Loading..." {
-		t.Errorf("before the first status: %q", vm.State.Get())
+	if vm.State.Get() == "" || vm.TrayStatus.Get() == "" {
+		t.Errorf("before the first status: %q %q", vm.State.Get(), vm.TrayStatus.Get())
 	}
 	vm.Refresh()
-	if vm.State.Get() != "Signed out" || vm.Detail.Get() != goodConfig.ServerURL || vm.Account.Get() != "" {
+	if vm.State.Get() != "Signed out" || vm.Detail.Get() != goodConfig.ServerURL || vm.Account.Get() != "Not signed in" {
 		t.Errorf("signed out: %q %q %q", vm.State.Get(), vm.Detail.Get(), vm.Account.Get())
 	}
-	if !strings.Contains(vm.Helper.Get(), "running") {
-		t.Errorf("helper: %q", vm.Helper.Get())
+	if !strings.Contains(vm.Helper.Get(), "running") || vm.TrayStatus.Get() != "Claimward: signed out" {
+		t.Errorf("helper %q tray %q", vm.Helper.Get(), vm.TrayStatus.Get())
 	}
 
 	f.set(func(st *appcore.Status) { st.LoggedIn, st.Email = true, "ada@example.org" })
 	vm.Refresh()
-	if vm.State.Get() != "Disconnected" || vm.Account.Get() != "Signed in as ada@example.org" {
-		t.Errorf("signed in: %q %q", vm.State.Get(), vm.Account.Get())
-	}
-	f.set(func(st *appcore.Status) { st.Email = "" })
-	vm.Refresh()
-	if vm.Account.Get() != "Signed in" {
-		t.Errorf("signed in, token without a name: %q", vm.Account.Get())
+	if vm.State.Get() != "Disconnected" || vm.Account.Get() != "Signed in as ada@example.org" || vm.Detail.Get() != goodConfig.ServerURL {
+		t.Errorf("signed in: %q %q %q", vm.State.Get(), vm.Account.Get(), vm.Detail.Get())
 	}
 
 	f.set(func(st *appcore.Status) {
-		st.Connected, st.AssignedIP, st.Interface, st.Tenant = true, "10.80.0.7/32", "Claimward", "chem"
-		st.Tenants = []hproto.Tenant{{ID: "chem", Name: "Chemistry"}, {ID: "hpc"}}
+		st.Connected, st.AssignedIP, st.Interface = true, "10.80.0.7/32", "Claimward"
 	})
 	vm.Refresh()
-	if vm.State.Get() != "Connected" || vm.Detail.Get() != "10.80.0.7/32 - Claimward" || vm.Tenant.Get() != "Tenant: Chemistry" {
-		t.Errorf("connected: %q %q %q", vm.State.Get(), vm.Detail.Get(), vm.Tenant.Get())
-	}
-	if vm.TrayStatus.Get() != "Claimward: Connected (10.80.0.7/32)" {
-		t.Errorf("tray: %q", vm.TrayStatus.Get())
+	if vm.State.Get() != "Connected" || !strings.Contains(vm.Detail.Get(), "10.80.0.7/32") || !strings.Contains(vm.TrayStatus.Get(), "10.80.0.7/32") {
+		t.Errorf("connected: %q %q %q", vm.State.Get(), vm.Detail.Get(), vm.TrayStatus.Get())
 	}
 
-	f.set(func(st *appcore.Status) { st.Tenant, st.Tenants = "hpc", nil })
+	f.set(func(st *appcore.Status) { *st = appcore.Status{ConfigError: "no server URL", HelperInstalled: false} })
 	vm.Refresh()
-	if vm.Tenant.Get() != "Tenant: hpc" {
-		t.Errorf("a tenant with no name is shown by id: %q", vm.Tenant.Get())
-	}
-
-	f.set(func(st *appcore.Status) { st.HelperInstalled = false })
-	vm.Refresh()
-	if !strings.Contains(vm.Helper.Get(), "not reachable") {
-		t.Errorf("helper missing: %q", vm.Helper.Get())
-	}
-
-	f.set(func(st *appcore.Status) { *st = appcore.Status{ConfigError: "missing config: server_url"} })
-	vm.Refresh()
-	if vm.State.Get() != "Not configured" || vm.Detail.Get() != "missing config: server_url" {
-		t.Errorf("unconfigured: %q %q", vm.State.Get(), vm.Detail.Get())
-	}
-	if vm.TrayStatus.Get() != "Claimward: Not configured" {
-		t.Errorf("tray: %q", vm.TrayStatus.Get())
+	if vm.State.Get() != "Not configured" || vm.Detail.Get() != "no server URL" || !strings.Contains(vm.Helper.Get(), "not running") {
+		t.Errorf("unconfigured: %q %q %q", vm.State.Get(), vm.Detail.Get(), vm.Helper.Get())
 	}
 }
 
-// Each state offers what can be done in it and nothing else.
-func TestCommandsFollowTheState(t *testing.T) {
-	f := &fakeCore{st: appcore.Status{ConfigError: "missing"}}
-	vm := newVM(t, f)
-	if got := commands(vm); !reflect.DeepEqual(got, commandState{"SignIn": false, "Connect": false, "Disconnect": false, "SignOut": false, "ChooseTenant": false}) {
-		t.Errorf("unconfigured: %v", got)
+func TestTheDefaultPostRunsInline(t *testing.T) {
+	vm := NewViewModel(signedIn())
+	vm.Apply(signedIn().st)
+	if vm.State.Get() != "Disconnected" {
+		t.Errorf("state %q", vm.State.Get())
 	}
-	f.set(func(st *appcore.Status) { *st = signedOut().st })
-	vm.Refresh()
-	if got := commands(vm); !reflect.DeepEqual(got, commandState{"SignIn": true, "Connect": false, "Disconnect": false, "SignOut": false, "ChooseTenant": false}) {
+}
+
+func TestCommandsFollowTheModel(t *testing.T) {
+	f := signedOut()
+	vm, q := newVM(t, f)
+	can := func() [5]bool {
+		return [5]bool{vm.SignIn.CanExecute(), vm.Connect.CanExecute(), vm.Disconnect.CanExecute(), vm.SignOut.CanExecute(), vm.ChooseTenant.CanExecute()}
+	}
+	if got := can(); got != [5]bool{true, false, false, false, false} {
 		t.Errorf("signed out: %v", got)
 	}
 	f.set(func(st *appcore.Status) { st.LoggedIn = true })
 	vm.Refresh()
-	if got := commands(vm); !reflect.DeepEqual(got, commandState{"SignIn": false, "Connect": true, "Disconnect": false, "SignOut": true, "ChooseTenant": true}) {
+	q.Drain()
+	if got := can(); got != [5]bool{false, true, false, true, true} {
 		t.Errorf("signed in: %v", got)
 	}
 	f.set(func(st *appcore.Status) { st.Connected = true })
 	vm.Refresh()
-	if got := commands(vm); !reflect.DeepEqual(got, commandState{"SignIn": false, "Connect": false, "Disconnect": true, "SignOut": true, "ChooseTenant": false}) {
+	q.Drain()
+	if got := can(); got != [5]bool{false, false, true, true, true} {
 		t.Errorf("connected: %v", got)
 	}
 }
 
-// manual is a dispatcher a test steps through: spawned work waits until the
-// test runs it, and posted results go through a Queue the test drains.
-type manual struct {
-	q    Queue
-	work []func()
-}
-
-func (m *manual) spawn(f func()) { m.work = append(m.work, f) }
-
-func (m *manual) runWork() {
-	w := m.work
-	m.work = nil
-	for _, f := range w {
-		f()
-	}
-	m.q.Drain()
-}
-
-// While something runs, nothing else may start, and Busy says what runs.
-func TestBusyHoldsTheOtherCommands(t *testing.T) {
+func TestConnectAndDisconnectRunAwayFromTheUIThread(t *testing.T) {
 	f := signedIn()
-	m := &manual{}
-	vm := NewViewModel(f, WithDispatch(m.spawn, m.q.Post))
-	vm.Refresh()
-	m.runWork()
+	f.connectWait = make(chan struct{})
+	vm, q := newVM(t, f)
 	vm.Connect.Execute()
-	if vm.Busy.Get() != "Connecting..." {
-		t.Errorf("busy %q", vm.Busy.Get())
+	// The call is under way: Busy is posted, nothing else is offered.
+	deadline := time.Now().Add(5 * time.Second)
+	for f.called("Connect") == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-	if got := commands(vm); got["Connect"] || got["SignOut"] || got["ChooseTenant"] {
-		t.Errorf("while connecting: %v", got)
+	q.Drain()
+	if vm.Busy.Get() == "" || vm.Connect.CanExecute() || vm.Disconnect.CanExecute() {
+		t.Errorf("while connecting: busy %q connect %v disconnect %v", vm.Busy.Get(), vm.Connect.CanExecute(), vm.Disconnect.CanExecute())
 	}
-	vm.Connect.Execute() // a second click is not a second connection
-	m.runWork()
-	m.runWork() // the refresh the end of the work asked for
-	if f.called("Connect") != 1 {
-		t.Errorf("Connect called %d times", f.called("Connect"))
+	close(f.connectWait)
+	settle(vm, q)
+	if vm.State.Get() != "Connected" || vm.Busy.Get() != "" || !vm.Disconnect.CanExecute() {
+		t.Errorf("connected: %q busy %q", vm.State.Get(), vm.Busy.Get())
 	}
-	if vm.Busy.Get() != "" || vm.State.Get() != "Connected" || !vm.Disconnect.CanExecute() {
-		t.Errorf("after: busy %q state %q", vm.Busy.Get(), vm.State.Get())
+	run(vm, q, vm.Disconnect.Execute)
+	if f.called("Disconnect") != 1 || vm.State.Get() != "Disconnected" {
+		t.Errorf("disconnect %d state %q", f.called("Disconnect"), vm.State.Get())
 	}
-	// A poll while a status read is under way is dropped.
-	vm.Refresh()
-	vm.Refresh()
-	if len(m.work) != 1 {
-		t.Errorf("%d status reads queued, want 1", len(m.work))
+	run(vm, q, vm.SignOut.Execute)
+	if f.called("Logout") != 1 || vm.State.Get() != "Signed out" {
+		t.Errorf("logout %d state %q", f.called("Logout"), vm.State.Get())
 	}
 }
 
-func TestSignInWithTheDeviceFlow(t *testing.T) {
+func TestAFailureIsTheMessage(t *testing.T) {
+	f := signedIn()
+	f.connectErr = errors.New("helper refused")
+	vm, q := newVM(t, f)
+	run(vm, q, vm.Connect.Execute)
+	if !strings.Contains(vm.Message.Get(), "helper refused") {
+		t.Errorf("message %q", vm.Message.Get())
+	}
+}
+
+func TestSigningIn(t *testing.T) {
 	f := signedOut()
 	f.loginWait = make(chan struct{})
-	q := &Queue{}
 	var opened []string
-	vm := NewViewModel(f,
-		WithDispatch(func(fn func()) { go fn() }, q.Post),
-		WithOpener(func(u string) error { opened = append(opened, u); return nil }))
-	refresh := func() {
-		t.Helper()
-		vm.Refresh()
-		waitFor(t, q, func() bool { return !vm.refreshing })
-	}
-	refresh()
-	if vm.SignInPanel.Get() != PanelHidden || vm.OpenSignInPage.CanExecute() {
-		t.Error("the device prompt shows before a sign-in")
-	}
+	vm, q := newVM(t, f, WithOpener(func(u string) error { opened = append(opened, u); return nil }))
 	vm.SignIn.Execute()
-	if vm.Busy.Get() != "Signing in..." || !vm.CancelSignIn.CanExecute() || vm.SignIn.CanExecute() {
-		t.Errorf("signing in: busy %q", vm.Busy.Get())
+	deadline := time.Now().Add(5 * time.Second)
+	for f.called("Login") == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-	// The provider answers with a code to type at a page.
 	f.set(func(st *appcore.Status) {
 		st.DeviceVerificationURI, st.DeviceUserCode = "https://github.com/login/device", "WDJB-MJHT"
 	})
-	refresh()
-	if vm.SignInPanel.Get() != PanelShown || vm.DeviceCode.Get() != "WDJB-MJHT" || vm.DeviceURI.Get() != "https://github.com/login/device" {
-		t.Errorf("prompt: panel %d code %q uri %q", vm.SignInPanel.Get(), vm.DeviceCode.Get(), vm.DeviceURI.Get())
+	vm.Refresh()
+	q.Drain()
+	if vm.SignInPanel.Get() != PanelShown || vm.DeviceURI.Get() != "https://github.com/login/device" || vm.DeviceCode.Get() != "WDJB-MJHT" {
+		t.Fatalf("panel %d %q %q", vm.SignInPanel.Get(), vm.DeviceURI.Get(), vm.DeviceCode.Get())
+	}
+	if !vm.OpenSignInPage.CanExecute() || !vm.CancelSignIn.CanExecute() {
+		t.Fatal("the prompt does not offer its two buttons")
 	}
 	vm.OpenSignInPage.Execute()
-	if !reflect.DeepEqual(opened, []string{"https://github.com/login/device"}) {
+	settleOpen := time.Now().Add(5 * time.Second)
+	for len(opened) == 0 && time.Now().Before(settleOpen) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(opened) != 1 || opened[0] != "https://github.com/login/device" {
 		t.Errorf("opened %v", opened)
 	}
 	close(f.loginWait)
-	waitFor(t, q, func() bool { return vm.Busy.Get() == "" && vm.State.Get() == "Disconnected" })
-	if vm.SignInPanel.Get() != PanelHidden || vm.CancelSignIn.CanExecute() || vm.Message.Get() != "" {
-		t.Errorf("after: panel %d cancel %v message %q", vm.SignInPanel.Get(), vm.CancelSignIn.CanExecute(), vm.Message.Get())
+	settle(vm, q)
+	if vm.State.Get() != "Disconnected" || vm.SignInPanel.Get() != PanelHidden || vm.DeviceCode.Get() != "" {
+		t.Errorf("after the sign-in: %q panel %d code %q", vm.State.Get(), vm.SignInPanel.Get(), vm.DeviceCode.Get())
 	}
 }
 
-func TestCancelSignIn(t *testing.T) {
+func TestCancellingASignIn(t *testing.T) {
 	f := signedOut()
 	f.loginWait = make(chan struct{})
-	q := &Queue{}
-	vm := NewViewModel(f, WithDispatch(func(fn func()) { go fn() }, q.Post))
-	vm.Refresh()
-	waitFor(t, q, func() bool { return vm.SignIn.CanExecute() })
+	vm, q := newVM(t, f)
 	vm.SignIn.Execute()
-	vm.CancelSignIn.Execute()
-	waitFor(t, q, func() bool { return vm.Busy.Get() == "" })
-	if vm.Message.Get() != "Sign-in cancelled." || vm.State.Get() != "Signed out" || vm.CancelSignIn.CanExecute() {
-		t.Errorf("message %q state %q", vm.Message.Get(), vm.State.Get())
+	deadline := time.Now().Add(5 * time.Second)
+	for f.called("Login") == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-	vm.CancelSignIn.Execute() // nothing to cancel: no effect
-}
-
-func TestSignInFailure(t *testing.T) {
-	f := signedOut()
-	f.loginErr = errors.New("device flow: access_denied")
-	vm := newVM(t, f)
-	vm.SignIn.Execute()
-	if vm.Message.Get() != "device flow: access_denied" || vm.State.Get() != "Signed out" {
+	q.Drain()
+	if !vm.CancelSignIn.CanExecute() {
+		t.Fatal("a sign-in under way cannot be cancelled")
+	}
+	run(vm, q, vm.CancelSignIn.Execute)
+	if vm.Message.Get() != "Sign-in cancelled." || vm.State.Get() != "Signed out" {
 		t.Errorf("message %q state %q", vm.Message.Get(), vm.State.Get())
 	}
 }
 
-// Only an https page is handed to the shell: on Windows a "URL" can name a
-// program to run.
-func TestOnlyAnHTTPSSignInPageIsOpened(t *testing.T) {
-	for _, uri := range []string{"http://github.com/login/device", `C:\Windows\System32\calc.exe`, "file:///C:/x.exe",
-		"javascript:alert(1)", "https://", "ms-settings:network"} {
-		f := signedOut()
-		f.st.DeviceVerificationURI = uri
-		opened := 0
-		vm := newVM(t, f, WithOpener(func(string) error { opened++; return nil }))
-		vm.OpenSignInPage.Execute()
-		if opened != 0 || !strings.Contains(vm.Message.Get(), "https") {
-			t.Errorf("%q: opened %d times, message %q", uri, opened, vm.Message.Get())
-		}
-	}
-	f := signedOut()
-	f.st.DeviceVerificationURI = "https://login.example.org/device"
-	vm := newVM(t, f, WithOpener(func(string) error { return errors.New("no default browser") }))
-	vm.OpenSignInPage.Execute()
-	if !strings.Contains(vm.Message.Get(), "no default browser") || !strings.Contains(vm.Message.Get(), "https://login.example.org/device") {
-		t.Errorf("a browser that fails: %q", vm.Message.Get())
-	}
-}
-
-// A person in several tenants who chose none is told to choose; the choice
-// is offered, made, and the next connection uses it.
-func TestConnectRefusedUntilATenantIsChosen(t *testing.T) {
+func TestTheTenantChoice(t *testing.T) {
 	f := signedIn()
 	f.offered = []hproto.Tenant{{ID: "chem", Name: "Chemistry"}, {ID: "hpc", Name: "HPC"}}
-	vm := newVM(t, f)
+	vm, q := newVM(t, f)
 	if vm.TenantPanel.Get() != PanelHidden {
-		t.Error("the choice shows before anything was offered")
+		t.Error("the tenant choice shows before the server offered one")
 	}
-	vm.Connect.Execute()
-	if vm.Message.Get() != "You belong to several tenants: choose one, then Connect." {
+	run(vm, q, vm.Connect.Execute)
+	if vm.TenantPanel.Get() != PanelShown || vm.State.Get() == "Connected" {
+		t.Fatalf("after ErrTenantRequired: panel %d state %q message %q", vm.TenantPanel.Get(), vm.State.Get(), vm.Message.Get())
+	}
+	want := []string{"Choose a tenant…", "Chemistry (chem)", "HPC (hpc)"}
+	if got := vm.TenantNames.Slice(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("rows %v, want %v", got, want)
+	}
+	if !strings.Contains(vm.Message.Get(), "several tenants") {
 		t.Errorf("message %q", vm.Message.Get())
 	}
-	if vm.TenantPanel.Get() != PanelShown {
-		t.Fatal("the tenant choice is not shown")
-	}
-	if got := vm.TenantNames.Slice(); !reflect.DeepEqual(got, []string{chooseTenant, "Chemistry (chem)", "HPC (hpc)"}) {
-		t.Errorf("rows %v", got)
-	}
-	if vm.TenantIndex.Get() != 0 || f.called("SetTenant") != 0 {
-		t.Errorf("index %d, SetTenant called %d times before any choice", vm.TenantIndex.Get(), f.called("SetTenant"))
-	}
 
-	vm.TenantIndex.Set(2) // the person picks HPC
-	if !reflect.DeepEqual(f.setTenant, []string{"hpc"}) {
-		t.Errorf("SetTenant %v", f.setTenant)
-	}
-	if vm.Tenant.Get() != "Tenant: HPC" || vm.TenantIndex.Get() != 2 {
-		t.Errorf("tenant %q index %d", vm.Tenant.Get(), vm.TenantIndex.Get())
-	}
-	// Refreshing re-applies the same choice without calling SetTenant.
+	// A refresh that only repeats what the model says is not the person
+	// choosing.
 	vm.Refresh()
-	vm.Refresh()
-	if f.called("SetTenant") != 1 {
-		t.Errorf("SetTenant called %d times", f.called("SetTenant"))
+	q.Drain()
+	if len(f.setTenant) != 0 {
+		t.Fatalf("a poll chose a tenant: %v", f.setTenant)
 	}
-	vm.Connect.Execute()
-	if vm.State.Get() != "Connected" || vm.Message.Get() != "" {
-		t.Errorf("state %q message %q", vm.State.Get(), vm.Message.Get())
+	// The person picks the third row.
+	vm.TenantIndex.Set(2)
+	q.Drain()
+	if len(f.setTenant) != 1 || f.setTenant[0] != "hpc" || vm.TenantIndex.Get() != 2 || vm.Tenant.Get() != "Tenant: HPC (hpc)" {
+		t.Errorf("SetTenant %v index %d tenant %q", f.setTenant, vm.TenantIndex.Get(), vm.Tenant.Get())
 	}
-	if vm.TenantPanel.Get() != PanelHidden {
-		t.Error("the choice stays open while connected")
-	}
-
-	vm.Disconnect.Execute()
-	vm.TenantIndex.Set(0) // back to "the server's choice"
-	if got := f.setTenant[len(f.setTenant)-1]; got != "" {
-		t.Errorf("choosing the first row set tenant %q", got)
+	run(vm, q, vm.Connect.Execute)
+	if vm.State.Get() != "Connected" || vm.TenantPanel.Get() != PanelHidden {
+		t.Errorf("state %q panel %d", vm.State.Get(), vm.TenantPanel.Get())
 	}
 }
 
-func TestATenantChoiceTheCoreRefuses(t *testing.T) {
+func TestChoosingATenantAsksTheServer(t *testing.T) {
 	f := signedIn()
 	f.offered = []hproto.Tenant{{ID: "chem"}, {ID: "hpc"}}
-	vm := newVM(t, f)
-	vm.ChooseTenant.Execute()
-	f.setTenantErr = errors.New(`"hpc" is not a tenant you were offered`)
-	vm.TenantIndex.Set(2)
-	if !strings.Contains(vm.Message.Get(), "not a tenant you were offered") {
-		t.Errorf("message %q", vm.Message.Get())
-	}
-	// The status puts the DropDown back on what is actually chosen.
-	if vm.TenantIndex.Get() != 0 {
-		t.Errorf("index %d after a refused choice", vm.TenantIndex.Get())
-	}
-}
-
-// "Choose tenant" asks the server; a person in one tenant never chooses.
-func TestChooseTenant(t *testing.T) {
-	f := signedIn()
-	f.offered = []hproto.Tenant{{ID: "chem", Name: "Chemistry"}}
-	vm := newVM(t, f)
-	vm.ChooseTenant.Execute()
-	if f.called("Tenants") != 1 || vm.TenantPanel.Get() != PanelHidden ||
-		vm.Message.Get() != "You belong to one tenant: there is nothing to choose." {
-		t.Errorf("one tenant: panel %d message %q", vm.TenantPanel.Get(), vm.Message.Get())
-	}
-
-	f.offered = nil
-	vm.ChooseTenant.Execute()
-	if vm.Message.Get() != "The server lists no tenant for you." {
-		t.Errorf("no tenant: %q", vm.Message.Get())
-	}
-
-	f.offered = []hproto.Tenant{{ID: "chem", Name: "Chemistry"}, {ID: "hpc", Name: "hpc"}}
-	vm.ChooseTenant.Execute()
-	if vm.TenantPanel.Get() != PanelShown || vm.Message.Get() != "" {
-		t.Errorf("two tenants: panel %d message %q", vm.TenantPanel.Get(), vm.Message.Get())
-	}
-	if got := vm.TenantNames.Slice(); !reflect.DeepEqual(got, []string{chooseTenant, "Chemistry (chem)", "hpc"}) {
-		t.Errorf("rows %v", got)
-	}
-
-	f.tenantsErr = errors.New("helper: server unreachable")
-	vm.ChooseTenant.Execute()
-	if vm.Message.Get() != "helper: server unreachable" {
-		t.Errorf("error: %q", vm.Message.Get())
-	}
-}
-
-func TestConnectErrors(t *testing.T) {
-	f := signedIn()
-	f.connectErr = errors.New(`enroll: server "https://evil.example" is not one this helper is configured for`)
-	vm := newVM(t, f)
-	vm.Connect.Execute()
-	if vm.Message.Get() != f.connectErr.Error() || vm.State.Get() != "Disconnected" || !vm.Connect.CanExecute() {
-		t.Errorf("message %q state %q", vm.Message.Get(), vm.State.Get())
-	}
-	// The core's own ErrTenantRequired, wrapped, reads the same.
-	f.connectErr = errors.Join(errors.New("connect"), appcore.ErrTenantRequired)
-	vm.Connect.Execute()
-	if !strings.HasPrefix(vm.Message.Get(), "You belong to several tenants") {
-		t.Errorf("wrapped ErrTenantRequired: %q", vm.Message.Get())
-	}
-	// A new action clears the last message.
-	f.connectErr = nil
-	vm.Connect.Execute()
-	if vm.Message.Get() != "" || vm.State.Get() != "Connected" {
-		t.Errorf("message %q state %q", vm.Message.Get(), vm.State.Get())
-	}
-	f.disconnectErr = errors.New("helper: no answer")
-	vm.Disconnect.Execute()
-	if vm.Message.Get() != "helper: no answer" {
-		t.Errorf("disconnect error %q", vm.Message.Get())
-	}
-}
-
-func TestSignOut(t *testing.T) {
-	f := signedIn()
-	vm := newVM(t, f)
-	vm.SignOut.Execute()
-	if f.called("Logout") != 1 || vm.State.Get() != "Signed out" || vm.Account.Get() != "" || !vm.SignIn.CanExecute() {
-		t.Errorf("state %q account %q", vm.State.Get(), vm.Account.Get())
+	vm, q := newVM(t, f)
+	run(vm, q, vm.ChooseTenant.Execute)
+	if f.called("Tenants") != 1 || vm.TenantPanel.Get() != PanelShown || len(vm.TenantNames.Slice()) != 3 {
+		t.Errorf("Tenants %d panel %d rows %v", f.called("Tenants"), vm.TenantPanel.Get(), vm.TenantNames.Slice())
 	}
 }
 
 func TestSettings(t *testing.T) {
 	f := signedOut()
-	f.cfg.Provider = "go-authn"
-	f.cfg.OIDCIssuer, f.cfg.OIDCClientID = "https://login.example.org", "claimward"
-	vm := newVM(t, f, WithConfigPath(`Saved to C:\Users\ada\AppData\Roaming\Claimward\config.json`))
-	if vm.SaveSettings.CanExecute() || vm.CloseSettings.CanExecute() {
-		t.Error("saving is offered off the settings page")
+	f.cfg = appcore.Config{ServerURL: "https://old.example.org", Provider: "oidc", OIDCIssuer: "https://login.example.org", OIDCClientID: "cid"}
+	vm, q := newVM(t, f, WithConfigPath("Saved to /here"))
+	if vm.ConfigPath.Get() != "Saved to /here" {
+		t.Errorf("path %q", vm.ConfigPath.Get())
 	}
-	vm.OpenSettings.Execute()
-	if vm.Page.Get() != PageSettings || vm.ServerURL.Get() != goodConfig.ServerURL || vm.ProviderIndex.Get() != 2 ||
-		vm.ProviderPanel.Get() != ProviderOIDC || vm.OIDCIssuer.Get() != "https://login.example.org" || vm.OIDCClientID.Get() != "claimward" {
-		t.Errorf("form: page %d server %q provider %d panel %d", vm.Page.Get(), vm.ServerURL.Get(), vm.ProviderIndex.Get(), vm.ProviderPanel.Get())
+	run(vm, q, vm.OpenSettings.Execute)
+	if vm.Page.Get() != PageSettings || vm.ServerURL.Get() != "https://old.example.org" || vm.ProviderIndex.Get() != 1 ||
+		vm.OIDCIssuer.Get() != "https://login.example.org" || vm.OIDCClientID.Get() != "cid" || vm.ProviderPanel.Get() != ProviderOIDC {
+		t.Fatalf("form: page %d %q %d %q %q panel %d", vm.Page.Get(), vm.ServerURL.Get(), vm.ProviderIndex.Get(), vm.OIDCIssuer.Get(), vm.OIDCClientID.Get(), vm.ProviderPanel.Get())
 	}
-	if vm.SignIn.CanExecute() || vm.OpenSettings.CanExecute() {
-		t.Error("status commands are offered on the settings page")
+	// Opening them again, from the settings page, changes nothing.
+	vm.ServerURL.Set("https://typed.example.org")
+	vm.openSettings()
+	if vm.ServerURL.Get() != "https://typed.example.org" {
+		t.Error("a refused open overwrote what was typed")
 	}
+	vm.ServerURL.Set("https://old.example.org")
+	if vm.Page.Get() != PageSettings || vm.OpenSettings.CanExecute() {
+		t.Error("the settings page offers to open itself")
+	}
+
 	vm.ProviderIndex.Set(0)
 	if vm.ProviderPanel.Get() != ProviderGitHub {
-		t.Error("choosing GitHub does not show the GitHub field")
+		t.Error("GitHub shows the OIDC fields")
 	}
-	vm.ServerURL.Set("  https://vpn2.example.org/ ")
-	vm.GitHubClientID.Set(" Iv1.new ")
-	vm.SaveSettings.Execute()
-	if len(f.saved) != 1 {
-		t.Fatalf("saved %d times", len(f.saved))
+	vm.ProviderIndex.Set(2)
+	if vm.ProviderPanel.Get() != ProviderOIDC {
+		t.Error("go-authn shows the GitHub field")
 	}
-	got := f.saved[0]
-	want := appcore.Config{ServerURL: "https://vpn2.example.org/", Provider: "github", GitHubClientID: "Iv1.new",
-		OIDCIssuer: "https://login.example.org", OIDCClientID: "claimward", SocketPath: goodConfig.SocketPath}
-	if got != want {
-		t.Errorf("saved %+v\nwant  %+v", got, want)
+	vm.ProviderIndex.Set(-1)
+	if vm.ProviderPanel.Get() != ProviderGitHub {
+		t.Error("an unknown provider shows the OIDC fields")
 	}
-	if vm.Page.Get() != PageStatus || vm.Message.Get() != "" || vm.Detail.Get() != "https://vpn2.example.org/" {
-		t.Errorf("after saving: page %d message %q detail %q", vm.Page.Get(), vm.Message.Get(), vm.Detail.Get())
+
+	// A bad URL is refused, in the form.
+	vm.ServerURL.Set("ftp://nope")
+	run(vm, q, vm.SaveSettings.Execute)
+	if f.called("UpdateConfig") != 0 || !strings.Contains(vm.Message.Get(), "http(s) URL") || vm.Page.Get() != PageSettings {
+		t.Errorf("a bad URL: saved %d message %q page %d", f.called("UpdateConfig"), vm.Message.Get(), vm.Page.Get())
 	}
 
 	// An incomplete configuration is saved, and said to be.
-	vm.OpenSettings.Execute()
-	vm.ProviderIndex.Set(1)
-	vm.OIDCIssuer.Set("")
-	vm.SaveSettings.Execute()
-	if f.saved[1].Provider != "oidc" || !strings.HasPrefix(vm.Message.Get(), "Saved, but not complete: missing config: oidc_issuer") {
-		t.Errorf("incomplete: %+v %q", f.saved[1], vm.Message.Get())
+	vm.ServerURL.Set("  https://new.example.org ")
+	vm.ProviderIndex.Set(0)
+	vm.GitHubClientID.Set("")
+	run(vm, q, vm.SaveSettings.Execute)
+	if len(f.saved) != 1 || f.saved[0].ServerURL != "https://new.example.org" || f.saved[0].Provider != "github" {
+		t.Fatalf("saved %+v", f.saved)
+	}
+	if vm.Page.Get() != PageStatus || !strings.HasPrefix(vm.Message.Get(), "Saved, but not complete") {
+		t.Errorf("page %d message %q", vm.Page.Get(), vm.Message.Get())
 	}
 
-	// What is not a URL is not saved.
-	vm.OpenSettings.Execute()
-	for _, bad := range []string{"vpn.example.org", "ftp://vpn.example.org", "https://"} {
-		vm.ServerURL.Set(bad)
-		vm.SaveSettings.Execute()
-		if len(f.saved) != 2 || vm.Page.Get() != PageSettings || !strings.Contains(vm.Message.Get(), "http(s) URL") {
-			t.Errorf("%q: saved %d page %d message %q", bad, len(f.saved), vm.Page.Get(), vm.Message.Get())
-		}
-	}
-	// A save that fails stays on the form.
-	vm.ServerURL.Set("https://vpn.example.org")
-	f.updateErr = errors.New("access denied")
-	vm.SaveSettings.Execute()
-	if vm.Page.Get() != PageSettings || vm.Message.Get() != "access denied" {
-		t.Errorf("failed save: page %d message %q", vm.Page.Get(), vm.Message.Get())
-	}
-	// An out-of-range provider is GitHub, the default.
-	f.updateErr = nil
+	// An out-of-range provider is GitHub; a failure keeps the form open.
+	run(vm, q, vm.OpenSettings.Execute)
 	vm.ProviderIndex.Set(7)
-	vm.SaveSettings.Execute()
-	if f.saved[len(f.saved)-1].Provider != "github" {
-		t.Errorf("provider %q", f.saved[len(f.saved)-1].Provider)
+	vm.GitHubClientID.Set("Iv1.abc")
+	f.updateErr = errors.New("disk full")
+	run(vm, q, vm.SaveSettings.Execute)
+	if vm.Page.Get() != PageSettings || !strings.Contains(vm.Message.Get(), "disk full") {
+		t.Errorf("a failed save: page %d message %q", vm.Page.Get(), vm.Message.Get())
 	}
-	vm.OpenSettings.Execute()
 	vm.CloseSettings.Execute()
-	if vm.Page.Get() != PageStatus {
-		t.Error("Cancel does not leave the settings")
-	}
-	if vm.ConfigPath.Get() == "" {
-		t.Error("the form does not say where it saves")
+	q.Drain()
+	if vm.Page.Get() != PageStatus || vm.Message.Get() != "" {
+		t.Errorf("after cancel: page %d message %q", vm.Page.Get(), vm.Message.Get())
 	}
 }
 
-// The log is replaced when it changes, and left alone (no flicker, no
-// scroll reset) when it does not.
-func TestTheLogFollowsTheCore(t *testing.T) {
+func TestTheLogGrowsAndIsReplaced(t *testing.T) {
 	f := signedIn()
-	f.st.Log = []string{"10:00:00  signed in"}
-	vm := newVM(t, f)
-	events := 0
-	vm.Log.SubscribeChanged(func() { events++ })
+	f.st.Log = []string{"a"}
+	vm, q := newVM(t, f)
+	f.set(func(st *appcore.Status) { st.Log = []string{"a", "b"} })
 	vm.Refresh()
-	if events != 0 {
-		t.Errorf("an unchanged log was rewritten (%d events)", events)
+	q.Drain()
+	if got := vm.Log.Slice(); !reflect.DeepEqual(got, []string{"a", "b"}) {
+		t.Errorf("appended: %v", got)
 	}
-	f.set(func(st *appcore.Status) { st.Log = append(st.Log, "10:00:05  connected") })
-	vm.Refresh()
-	if !reflect.DeepEqual(vm.Log.Slice(), []string{"10:00:00  signed in", "10:00:05  connected"}) {
-		t.Errorf("log %v", vm.Log.Slice())
+	vm.Refresh() // unchanged
+	q.Drain()
+	if got := vm.Log.Slice(); !reflect.DeepEqual(got, []string{"a", "b"}) {
+		t.Errorf("unchanged: %v", got)
 	}
-	// A capped log that rotated (same length, new last line) is replaced.
-	f.set(func(st *appcore.Status) { st.Log = []string{"10:00:05  connected", "10:00:09  disconnecting"} })
+	f.set(func(st *appcore.Status) { st.Log = []string{"x"} })
 	vm.Refresh()
-	if vm.Log.At(1) != "10:00:09  disconnecting" {
-		t.Errorf("rotated log %v", vm.Log.Slice())
+	q.Drain()
+	if got := vm.Log.Slice(); !reflect.DeepEqual(got, []string{"x"}) {
+		t.Errorf("replaced: %v", got)
 	}
 }
 
-// waitFor drains q until cond holds.
-func waitFor(t *testing.T, q *Queue, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		q.Drain()
-		if cond() {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out")
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-}
-
-func TestPolling(t *testing.T) {
-	f := signedOut()
+func TestPollingStartsAndStops(t *testing.T) {
+	f := signedIn()
 	q := &Queue{}
-	vm := NewViewModel(f, WithDispatch(func(fn func()) { go fn() }, q.Post))
-	ctx, cancel := context.WithCancel(context.Background())
-	vm.StartPolling(ctx, 5*time.Millisecond)
-	waitFor(t, q, func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.statuses >= 3 })
-	if vm.State.Get() != "Signed out" {
-		t.Errorf("state %q", vm.State.Get())
+	vm := NewViewModel(f, WithPost(q.Post), WithInterval(5*time.Millisecond, 5*time.Millisecond))
+	vm.Start()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		q.Drain()
+		if vm.State.Get() == "Disconnected" {
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
-	f.set(func(st *appcore.Status) { st.LoggedIn = true })
-	waitFor(t, q, func() bool { return vm.State.Get() == "Disconnected" })
-	cancel()
-	time.Sleep(20 * time.Millisecond)
-	q.Drain()
-	f.mu.Lock()
-	n := f.statuses
-	f.mu.Unlock()
-	time.Sleep(30 * time.Millisecond)
-	q.Drain()
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.statuses > n+1 {
-		t.Errorf("polling went on after its context ended: %d then %d", n, f.statuses)
+	if vm.State.Get() != "Disconnected" {
+		t.Fatalf("the poll did not deliver a status: %q", vm.State.Get())
 	}
-}
-
-// The default opener refuses rather than doing something unseen.
-func TestTheDefaultOpenerRefuses(t *testing.T) {
-	f := signedOut()
-	f.st.DeviceVerificationURI = "https://github.com/login/device"
-	vm := newVM(t, f)
-	vm.OpenSignInPage.Execute()
-	if !strings.Contains(vm.Message.Get(), "no browser") {
-		t.Errorf("message %q", vm.Message.Get())
+	f.set(func(st *appcore.Status) { st.Connected = true })
+	for time.Now().Before(deadline) {
+		q.Drain()
+		if vm.State.Get() == "Connected" {
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
-}
-
-// The same number of tenants, different ones: the rows are rebuilt.
-func TestTenantRowsFollowTheOffer(t *testing.T) {
-	f := signedIn()
-	f.st.Tenants = []hproto.Tenant{{ID: "a"}, {ID: "b"}}
-	vm := newVM(t, f)
-	f.set(func(st *appcore.Status) { st.Tenants = []hproto.Tenant{{ID: "a"}, {ID: "c"}} })
-	vm.Refresh()
-	if got := vm.TenantNames.Slice(); !reflect.DeepEqual(got, []string{chooseTenant, "a", "c"}) {
-		t.Errorf("rows %v", got)
+	if vm.State.Get() != "Connected" {
+		t.Fatalf("a later poll was not delivered: %q", vm.State.Get())
 	}
+	vm.Stop()
+	vm.Wait()
 }

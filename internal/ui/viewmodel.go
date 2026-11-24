@@ -3,36 +3,27 @@
 // The ViewModel. It holds ALL of the window's and the tray's state as
 // go-widgets/mvvm primitives and NEVER references a widget: the View
 // (view.go) and the tray (tray_binding.go) bind to these, so state only
-// ever changes here. It drives a Core -- appcore.Core in the app, a fake in
-// the tests -- which does the work: sign-in, tenants, the helper.
+// ever changes here.
+//
+// The logic itself -- what the status means, which button is on offer, the
+// sign-in, the tenant choice, the settings form, the polling -- is
+// claimward-vpn-client's pkg/appvm, shared with the other apps. This file is
+// the adapter: every appvm.State is copied into the observables on the UI
+// thread (through the post function), and every command is a call on the
+// appvm.Model. No decision is taken here.
 
 package ui
 
 import (
-	"context"
-	"errors"
-	"fmt"
-	"net/url"
-	"strings"
 	"time"
 
 	"github.com/claimward/claimward-vpn-client/pkg/appcore"
-	"github.com/claimward/claimward-vpn-client/pkg/hproto"
+	"github.com/claimward/claimward-vpn-client/pkg/appvm"
 	"github.com/go-widgets/mvvm"
 )
 
 // Core is what the ViewModel needs of appcore.Core.
-type Core interface {
-	Status() appcore.Status
-	Config() appcore.Config
-	UpdateConfig(appcore.Config) error
-	Login(ctx context.Context) error
-	Tenants(ctx context.Context) ([]hproto.Tenant, error)
-	SetTenant(id string) error
-	Connect(ctx context.Context) error
-	Disconnect(ctx context.Context) error
-	Logout(ctx context.Context) error
-}
+type Core = appvm.Service
 
 var _ Core = (*appcore.Core)(nil)
 
@@ -49,26 +40,19 @@ const (
 	ProviderOIDC   = 1 // also go-authn: both take an issuer and a client id
 )
 
-// Providers are the identity providers offered, in DropDown order, with the
-// names appcore.Config uses for them.
-var Providers = []struct{ ID, Label string }{
-	{"github", "GitHub (device flow)"},
-	{"oidc", "OpenID Connect"},
-	{"go-authn", "go-authn (OIDC, registers the device key)"},
-}
-
-// chooseTenant is the first row of the tenant DropDown: "no choice made".
-const chooseTenant = "Choose a tenant..."
+// Providers are the identity providers offered, in DropDown order.
+var Providers = appvm.Providers
 
 // ViewModel is the application state.
 type ViewModel struct {
-	core Core
-	// open shows a URL in the default browser.
-	open func(string) error
-	// spawn runs blocking work (the Core talks to the helper and the
-	// network) away from the UI thread; post brings its result back to the
-	// UI thread, the only one that touches an observable.
-	spawn, post func(func())
+	m *appvm.Model
+	// post brings a result back to the UI thread, the only one that touches an
+	// observable.
+	post func(func())
+
+	// syncing is set while a State is copied, so that what the model says is
+	// not taken for the person choosing.
+	syncing bool
 
 	// Page is the window's page (PageStatus, PageSettings).
 	Page *mvvm.Observable[int]
@@ -91,7 +75,8 @@ type ViewModel struct {
 
 	// TenantPanel shows the tenant choice when the server offered several,
 	// or refused a connection until one is chosen. TenantNames are the
-	// DropDown's rows (chooseTenant first) and TenantIndex the selected one.
+	// DropDown's rows (the "no choice" row first) and TenantIndex the selected
+	// one.
 	TenantPanel *mvvm.Observable[int]
 	TenantNames *mvvm.ObservableList[string]
 	TenantIndex *mvvm.Observable[int]
@@ -112,45 +97,46 @@ type ViewModel struct {
 	ChooseTenant                              *mvvm.Command
 	OpenSettings, SaveSettings, CloseSettings *mvvm.Command
 
-	// rev changes with every status applied, so commands re-evaluate.
-	rev *mvvm.Observable[int]
-	// st is the last status applied, and tenants the ones it offered, in
-	// TenantNames order (after chooseTenant).
-	st      appcore.Status
-	tenants []hproto.Tenant
-	// syncing is set while applyStatus writes TenantIndex, so that what the
-	// server says is not taken for the person choosing.
-	syncing bool
-	// refreshing is set while a status read is under way.
-	refreshing bool
-	// cancelLogin stops a sign-in that waits for the person.
-	cancelLogin context.CancelFunc
+	// can is what the model allows now, so commands re-evaluate with it.
+	can *mvvm.Observable[appvm.Can]
+	// options are the tenant rows last copied, to rebuild the list only when
+	// they change.
+	options []appvm.TenantOption
 }
 
 // Option configures a ViewModel.
-type Option func(*ViewModel)
+type Option func(*config)
 
-// WithOpener replaces how a URL is opened (the default browser by default).
-func WithOpener(open func(string) error) Option { return func(vm *ViewModel) { vm.open = open } }
+type config struct {
+	post func(func())
+	opts appvm.Options
+}
 
-// WithDispatch replaces how work leaves and comes back to the UI thread:
-// spawn runs a blocking call, post runs a function on the UI thread. The
-// default runs both inline, which is right for a test and nothing else.
-func WithDispatch(spawn, post func(func())) Option {
-	return func(vm *ViewModel) { vm.spawn, vm.post = spawn, post }
+// WithOpener replaces how a URL is opened (application.OpenURL in the app).
+func WithOpener(open func(string) error) Option { return func(c *config) { c.opts.Open = open } }
+
+// WithPost replaces how a result comes back to the UI thread: post runs a
+// function there. The default runs it at once, which is right for a test that
+// calls Apply and nothing else.
+func WithPost(post func(func())) Option { return func(c *config) { c.post = post } }
+
+// WithInterval sets the polling intervals (see appvm.Options).
+func WithInterval(every, fast time.Duration) Option {
+	return func(c *config) { c.opts.Interval, c.opts.FastInterval = every, fast }
 }
 
 // WithConfigPath names where the settings are saved, for the form to say.
-func WithConfigPath(p string) Option { return func(vm *ViewModel) { vm.ConfigPath.Set(p) } }
+func WithConfigPath(p string) Option { return func(c *config) { c.opts.ConfigPath = p } }
 
-// NewViewModel builds the ViewModel over core. Call Refresh (or
-// StartPolling) to read the first status.
+// NewViewModel builds the ViewModel over core. Call Start to begin polling.
 func NewViewModel(core Core, opts ...Option) *ViewModel {
-	inline := func(f func()) { f() }
+	c := config{post: func(f func()) { f() }}
+	for _, o := range opts {
+		o(&c)
+	}
+	m := appvm.New(core, c.opts)
 	vm := &ViewModel{
-		core:  core,
-		open:  func(string) error { return errors.New("no browser") },
-		spawn: inline, post: inline,
+		m: m, post: c.post,
 
 		Page:    mvvm.NewObservable(PageStatus),
 		State:   mvvm.NewObservable("Loading..."),
@@ -166,7 +152,7 @@ func NewViewModel(core Core, opts ...Option) *ViewModel {
 		DeviceCode:  mvvm.NewObservable(""),
 
 		TenantPanel: mvvm.NewObservable(PanelHidden),
-		TenantNames: mvvm.NewObservableList(chooseTenant),
+		TenantNames: mvvm.NewObservableList[string](),
 		TenantIndex: mvvm.NewObservable(0),
 
 		Log: mvvm.NewObservableList[string](),
@@ -177,346 +163,163 @@ func NewViewModel(core Core, opts ...Option) *ViewModel {
 		OIDCClientID:   mvvm.NewObservable(""),
 		ProviderIndex:  mvvm.NewObservable(0),
 		ProviderPanel:  mvvm.NewObservable(ProviderGitHub),
-		ConfigPath:     mvvm.NewObservable(""),
+		ConfigPath:     mvvm.NewObservable(c.opts.ConfigPath),
 
 		TrayStatus: mvvm.NewObservable("Claimward"),
-		rev:        mvvm.NewObservable(0),
+		can:        mvvm.NewObservable(appvm.Can{}),
 	}
-	for _, o := range opts {
-		o(vm)
-	}
-
-	idle := func() bool { return vm.Busy.Get() == "" }
-	onStatus := func() bool { return vm.Page.Get() == PageStatus }
-	vm.SignIn = mvvm.NewCommand(vm.signIn, func() bool {
-		return onStatus() && idle() && vm.st.ConfigOK && !vm.st.LoggedIn
-	})
-	vm.CancelSignIn = mvvm.NewCommand(vm.cancelSignIn, func() bool { return vm.cancelLogin != nil })
-	vm.OpenSignInPage = mvvm.NewCommand(vm.openSignInPage, func() bool { return vm.DeviceURI.Get() != "" })
-	vm.Connect = mvvm.NewCommand(vm.connect, func() bool {
-		return idle() && vm.st.ConfigOK && vm.st.LoggedIn && !vm.st.Connected
-	})
-	vm.Disconnect = mvvm.NewCommand(vm.disconnect, func() bool { return idle() && vm.st.Connected })
-	vm.SignOut = mvvm.NewCommand(vm.signOut, func() bool { return onStatus() && idle() && vm.st.LoggedIn })
-	vm.ChooseTenant = mvvm.NewCommand(vm.chooseTenant, func() bool {
-		return onStatus() && idle() && vm.st.ConfigOK && vm.st.LoggedIn && !vm.st.Connected
-	})
-	vm.OpenSettings = mvvm.NewCommand(vm.openSettings, func() bool { return onStatus() })
-	vm.SaveSettings = mvvm.NewCommand(vm.saveSettings, func() bool { return !onStatus() && idle() })
-	vm.CloseSettings = mvvm.NewCommand(func() { vm.Page.Set(PageStatus) }, func() bool { return !onStatus() })
-	for _, c := range []*mvvm.Command{vm.SignIn, vm.CancelSignIn, vm.OpenSignInPage, vm.Connect, vm.Disconnect,
-		vm.SignOut, vm.ChooseTenant, vm.OpenSettings, vm.SaveSettings, vm.CloseSettings} {
-		mvvm.BindCanExecute(c, vm.Busy, vm.rev, vm.Page, vm.DeviceURI)
-	}
-
-	vm.TenantIndex.SubscribeChanged(vm.tenantChosen)
-	vm.ProviderIndex.Subscribe(func(i int) {
-		if i == 0 {
-			vm.ProviderPanel.Set(ProviderGitHub)
-		} else {
-			vm.ProviderPanel.Set(ProviderOIDC)
+	vm.commands()
+	vm.TenantIndex.SubscribeChanged(func() {
+		if !vm.syncing {
+			m.SelectTenant(vm.TenantIndex.Get())
 		}
 	})
+	vm.ProviderIndex.Subscribe(func(i int) {
+		if i >= 0 && i < len(Providers) && appvm.UsesIssuer(Providers[i].ID) {
+			vm.ProviderPanel.Set(ProviderOIDC)
+		} else {
+			vm.ProviderPanel.Set(ProviderGitHub)
+		}
+	})
+	vm.apply(m.State())
+	// Subscriber callbacks run on any goroutine and must not touch the
+	// observables: the state is carried to the UI thread.
+	m.Subscribe(func(st appvm.State) { vm.post(func() { vm.apply(st) }) })
 	return vm
 }
 
-// Refresh reads the Core's status away from the UI thread and applies it.
-// One read at a time: a poll that comes while one is under way is dropped.
-func (vm *ViewModel) Refresh() {
-	if vm.refreshing {
-		return
+func (vm *ViewModel) commands() {
+	cmd := func(run func(), ok func(appvm.Can) bool) *mvvm.Command {
+		c := mvvm.NewCommand(run, func() bool { return ok(vm.can.Get()) })
+		mvvm.BindCanExecute(c, vm.can)
+		return c
 	}
-	vm.refreshing = true
-	vm.spawn(func() {
-		st := vm.core.Status()
-		vm.post(func() {
-			vm.refreshing = false
-			vm.applyStatus(st)
-		})
-	})
-}
-
-// StartPolling refreshes now and then every interval until ctx ends. The
-// ticker posts to the UI thread; Refresh does the rest.
-func (vm *ViewModel) StartPolling(ctx context.Context, every time.Duration) {
-	vm.post(vm.Refresh)
-	go func() {
-		t := time.NewTicker(every)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				vm.post(vm.Refresh)
-			}
-		}
-	}()
-}
-
-// applyStatus turns a Core status into the observables. It is the only
-// writer of the status-derived state.
-func (vm *ViewModel) applyStatus(st appcore.Status) {
-	vm.st = st
-	switch {
-	case !st.ConfigOK:
-		vm.State.Set("Not configured")
-		vm.Detail.Set(st.ConfigError)
-	case st.Connected:
-		vm.State.Set("Connected")
-		vm.Detail.Set(joinNonEmpty(" - ", st.AssignedIP, st.Interface))
-	case st.LoggedIn:
-		vm.State.Set("Disconnected")
-		vm.Detail.Set(st.ServerURL)
-	default:
-		vm.State.Set("Signed out")
-		vm.Detail.Set(st.ServerURL)
-	}
-
-	switch {
-	case st.LoggedIn && st.Email != "":
-		vm.Account.Set("Signed in as " + st.Email)
-	case st.LoggedIn:
-		vm.Account.Set("Signed in")
-	default:
-		vm.Account.Set("")
-	}
-	if st.HelperInstalled {
-		vm.Helper.Set("Helper service: running")
-	} else {
-		vm.Helper.Set("Helper service not reachable: install it (see the README) or start ClaimwardHelper")
-	}
-
-	if st.DeviceVerificationURI != "" {
-		vm.DeviceURI.Set(st.DeviceVerificationURI)
-		vm.DeviceCode.Set(st.DeviceUserCode)
-		vm.SignInPanel.Set(PanelShown)
-	} else {
-		vm.SignInPanel.Set(PanelHidden)
-		vm.DeviceURI.Set("")
-		vm.DeviceCode.Set("")
-	}
-
-	vm.applyTenants(st)
-	vm.applyLog(st.Log)
-
-	tray := "Claimward: " + vm.State.Get()
-	if st.Connected && st.AssignedIP != "" {
-		tray += " (" + st.AssignedIP + ")"
-	}
-	vm.TrayStatus.Set(tray)
-	vm.rev.Set(vm.rev.Get() + 1)
-}
-
-// applyTenants shows the choice when there is one to make: several tenants
-// offered, or a connection refused until one is chosen. A person in one
-// tenant never chooses; the server uses it.
-func (vm *ViewModel) applyTenants(st appcore.Status) {
-	name := st.Tenant
-	for _, t := range st.Tenants {
-		if t.ID == st.Tenant && t.Name != "" {
-			name = t.Name
-		}
-	}
-	if name != "" {
-		vm.Tenant.Set("Tenant: " + name)
-	} else {
-		vm.Tenant.Set("")
-	}
-
-	show := st.LoggedIn && !st.Connected && (len(st.Tenants) > 1 || st.TenantRequired)
-	if !sameTenants(vm.tenants, st.Tenants) {
-		vm.tenants = append([]hproto.Tenant(nil), st.Tenants...)
-		rows := []string{chooseTenant}
-		for _, t := range vm.tenants {
-			rows = append(rows, tenantLabel(t))
-		}
-		vm.syncing = true
-		vm.TenantNames.Clear()
-		vm.TenantNames.Append(rows...)
-		vm.syncing = false
-	}
-	idx := 0
-	for i, t := range vm.tenants {
-		if t.ID == st.Tenant {
-			idx = i + 1
-		}
-	}
-	vm.syncing = true
-	vm.TenantIndex.Set(idx)
-	vm.syncing = false
-	if show {
-		vm.TenantPanel.Set(PanelShown)
-	} else {
-		vm.TenantPanel.Set(PanelHidden)
-	}
-}
-
-func (vm *ViewModel) applyLog(lines []string) {
-	if len(lines) == vm.Log.Len() && (len(lines) == 0 || lines[len(lines)-1] == vm.Log.At(vm.Log.Len()-1)) {
-		return
-	}
-	vm.Log.Clear()
-	vm.Log.Append(lines...)
-}
-
-// tenantChosen is the person picking a row of the tenant DropDown.
-func (vm *ViewModel) tenantChosen() {
-	if vm.syncing {
-		return
-	}
-	i := vm.TenantIndex.Get()
-	id := ""
-	if i > 0 && i <= len(vm.tenants) {
-		id = vm.tenants[i-1].ID
-	}
-	vm.run("Choosing the tenant...", func() error { return vm.core.SetTenant(id) }, nil)
-}
-
-// run does work away from the UI thread with Busy set; back on the UI
-// thread it calls after (when given), clears Busy, reports the error and
-// refreshes.
-func (vm *ViewModel) run(busy string, work func() error, after func(error)) {
-	vm.Busy.Set(busy)
-	vm.Message.Set("")
-	vm.spawn(func() {
-		err := work()
-		vm.post(func() {
-			if after != nil {
-				after(err)
-			}
-			vm.Busy.Set("")
-			if err != nil {
-				vm.Message.Set(describe(err))
-			}
-			vm.Refresh()
-		})
-	})
-}
-
-// describe is an error as the person reads it.
-func describe(err error) string {
-	switch {
-	case errors.Is(err, appcore.ErrTenantRequired):
-		return "You belong to several tenants: choose one, then Connect."
-	case errors.Is(err, context.Canceled):
-		return "Sign-in cancelled."
-	}
-	return err.Error()
-}
-
-func (vm *ViewModel) signIn() {
-	ctx, cancel := context.WithCancel(context.Background())
-	vm.cancelLogin = cancel
-	vm.run("Signing in...", func() error { return vm.core.Login(ctx) }, func(error) {
-		cancel()
-		vm.cancelLogin = nil
-	})
-}
-
-func (vm *ViewModel) cancelSignIn() {
-	if vm.cancelLogin != nil {
-		vm.cancelLogin()
-	}
-}
-
-// openSignInPage opens the device-flow page. Only an https URL is opened:
-// it came from the identity provider through the network, and on Windows a
-// URL handed to the shell can as well name a program to run.
-func (vm *ViewModel) openSignInPage() {
-	raw := vm.DeviceURI.Get()
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Host == "" {
-		vm.Message.Set(fmt.Sprintf("Not opening %q: the sign-in page must be an https URL. Open it yourself if you trust it.", raw))
-		return
-	}
-	if err := vm.open(u.String()); err != nil {
-		vm.Message.Set("Could not open the browser: " + err.Error() + ". Open " + u.String() + " yourself.")
-	}
-}
-
-func (vm *ViewModel) connect() {
-	vm.run("Connecting...", func() error { return vm.core.Connect(context.Background()) }, nil)
-}
-
-func (vm *ViewModel) disconnect() {
-	vm.run("Disconnecting...", func() error { return vm.core.Disconnect(context.Background()) }, nil)
-}
-
-func (vm *ViewModel) signOut() {
-	vm.run("Signing out...", func() error { return vm.core.Logout(context.Background()) }, nil)
-}
-
-// chooseTenant asks the server which tenants the person may join. Several
-// show the choice (applyTenants); one, or none, is said so.
-func (vm *ViewModel) chooseTenant() {
-	var n int
-	vm.run("Asking the server for your tenants...", func() error {
-		ts, err := vm.core.Tenants(context.Background())
-		n = len(ts)
-		return err
-	}, func(err error) {
-		if err != nil {
-			return
-		}
-		switch n {
-		case 0:
-			vm.Message.Set("The server lists no tenant for you.")
-		case 1:
-			vm.Message.Set("You belong to one tenant: there is nothing to choose.")
-		}
-	})
+	vm.SignIn = cmd(vm.m.SignIn, func(c appvm.Can) bool { return c.SignIn })
+	vm.CancelSignIn = cmd(vm.m.CancelSignIn, func(c appvm.Can) bool { return c.CancelSignIn })
+	vm.OpenSignInPage = cmd(vm.m.OpenSignInPage, func(c appvm.Can) bool { return c.OpenSignInPage })
+	vm.ChooseTenant = cmd(vm.m.ChooseTenant, func(c appvm.Can) bool { return c.ChooseTenant })
+	vm.Connect = cmd(vm.m.Connect, func(c appvm.Can) bool { return c.Connect })
+	vm.Disconnect = cmd(vm.m.Disconnect, func(c appvm.Can) bool { return c.Disconnect })
+	vm.SignOut = cmd(vm.m.SignOut, func(c appvm.Can) bool { return c.SignOut })
+	vm.OpenSettings = cmd(vm.openSettings, func(c appvm.Can) bool { return c.OpenSettings })
+	vm.SaveSettings = cmd(vm.saveSettings, func(c appvm.Can) bool { return c.SaveSettings })
+	vm.CloseSettings = cmd(vm.m.CloseSettings, func(c appvm.Can) bool { return c.CloseSettings })
 }
 
 // openSettings fills the form from the configuration in use.
 func (vm *ViewModel) openSettings() {
-	c := vm.core.Config()
-	vm.ServerURL.Set(c.ServerURL)
-	vm.GitHubClientID.Set(c.GitHubClientID)
-	vm.OIDCIssuer.Set(c.OIDCIssuer)
-	vm.OIDCClientID.Set(c.OIDCClientID)
-	idx := 0
-	for i, p := range Providers {
-		if p.ID == c.Provider {
-			idx = i
-		}
+	f, ok := vm.m.OpenSettings()
+	if !ok {
+		return
 	}
-	vm.ProviderIndex.Set(idx)
-	vm.Message.Set("")
-	vm.Page.Set(PageSettings)
+	vm.ServerURL.Set(f.ServerURL)
+	vm.ProviderIndex.Set(appvm.ProviderIndex(f.Provider))
+	vm.GitHubClientID.Set(f.GitHubClientID)
+	vm.OIDCIssuer.Set(f.OIDCIssuer)
+	vm.OIDCClientID.Set(f.OIDCClientID)
 }
 
-// saveSettings saves the form. An incomplete configuration is saved all
-// the same -- the person may be filling it in over two sittings -- and the
-// status page says what it lacks.
+// saveSettings hands the form to the model, which saves it (an incomplete
+// configuration too) and says what is wrong with it.
 func (vm *ViewModel) saveSettings() {
-	c := vm.core.Config()
-	c.ServerURL = strings.TrimSpace(vm.ServerURL.Get())
-	c.GitHubClientID = strings.TrimSpace(vm.GitHubClientID.Get())
-	c.OIDCIssuer = strings.TrimSpace(vm.OIDCIssuer.Get())
-	c.OIDCClientID = strings.TrimSpace(vm.OIDCClientID.Get())
-	c.Provider = Providers[0].ID
-	if i := vm.ProviderIndex.Get(); i >= 0 && i < len(Providers) {
-		c.Provider = Providers[i].ID
+	i := vm.ProviderIndex.Get()
+	if i < 0 || i >= len(Providers) {
+		i = 0
 	}
-	if c.ServerURL != "" {
-		if u, err := url.Parse(c.ServerURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-			vm.Message.Set("The server URL must be an http(s) URL, such as https://vpn.example.org.")
-			return
-		}
-	}
-	vm.run("Saving...", func() error { return vm.core.UpdateConfig(c) }, func(err error) {
-		if err != nil {
-			return
-		}
-		vm.Page.Set(PageStatus)
-		if err := c.Validate(); err != nil {
-			vm.Message.Set("Saved, but not complete: " + err.Error())
-		}
+	vm.m.SaveSettings(appvm.Form{
+		ServerURL: vm.ServerURL.Get(), Provider: Providers[i].ID,
+		GitHubClientID: vm.GitHubClientID.Get(),
+		OIDCIssuer:     vm.OIDCIssuer.Get(), OIDCClientID: vm.OIDCClientID.Get(),
 	})
 }
 
-func sameTenants(a, b []hproto.Tenant) bool {
+// Model is the shared view model, for what the app does with its events.
+func (vm *ViewModel) Model() *appvm.Model { return vm.m }
+
+// Start polls the status until Stop. The first poll is immediate.
+func (vm *ViewModel) Start() { vm.m.Start() }
+
+// Stop ends the polling and cancels the action in progress.
+func (vm *ViewModel) Stop() { vm.m.Stop() }
+
+// Wait blocks until the poller and every action have finished and published
+// their results. Results still have to be run on the UI thread.
+func (vm *ViewModel) Wait() { vm.m.Wait() }
+
+// Refresh reads the status once, as a poll does.
+func (vm *ViewModel) Refresh() { vm.m.Refresh() }
+
+// Apply shows a status, as a poll does.
+func (vm *ViewModel) Apply(st appcore.Status) { vm.m.Apply(st) }
+
+// apply copies a State into the observables. It runs on the UI thread.
+func (vm *ViewModel) apply(st appvm.State) {
+	vm.syncing = true
+	defer func() { vm.syncing = false }()
+
+	vm.can.Set(st.Can)
+	if st.Screen == appvm.ScreenSettings {
+		vm.Page.Set(PageSettings)
+	} else {
+		vm.Page.Set(PageStatus)
+	}
+	vm.State.Set(st.Headline)
+	switch {
+	case st.Screen == appvm.ScreenUnconfigured:
+		vm.Detail.Set(st.Problem)
+	case st.Connected:
+		vm.Detail.Set(st.Address)
+	default:
+		vm.Detail.Set(st.Server)
+	}
+	vm.Account.Set(st.Account)
+	vm.Helper.Set(st.Helper)
+	vm.Tenant.Set(st.Tenant)
+	vm.Busy.Set(st.Busy)
+	if st.SettingsError != "" {
+		vm.Message.Set(st.SettingsError)
+	} else {
+		vm.Message.Set(st.Error)
+	}
+	vm.ConfigPath.Set(st.ConfigPath)
+	vm.TrayStatus.Set(st.TrayText)
+
+	if st.Slot == appvm.SlotSignIn {
+		vm.SignInPanel.Set(PanelShown)
+	} else {
+		vm.SignInPanel.Set(PanelHidden)
+	}
+	vm.DeviceURI.Set(st.SignInURL)
+	vm.DeviceCode.Set(st.SignInCode)
+
+	// The choice is made before connecting: once connected the tenant is the
+	// session's, and the status line says which.
+	if st.Slot == appvm.SlotTenants && !st.Connected {
+		vm.TenantPanel.Set(PanelShown)
+	} else {
+		vm.TenantPanel.Set(PanelHidden)
+	}
+	if !sameOptions(vm.options, st.TenantOptions) {
+		vm.options = append([]appvm.TenantOption(nil), st.TenantOptions...)
+		rows := make([]string, len(vm.options))
+		for i, o := range vm.options {
+			rows[i] = o.Label
+		}
+		vm.TenantNames.Clear()
+		vm.TenantNames.Append(rows...)
+	}
+	vm.TenantIndex.Set(st.TenantIndex)
+
+	lines, appended := appvm.LogDelta(vm.Log.Slice(), st.Log)
+	if !appended {
+		vm.Log.Clear()
+	}
+	if len(lines) > 0 || !appended {
+		vm.Log.Append(lines...)
+	}
+}
+
+func sameOptions(a, b []appvm.TenantOption) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -526,21 +329,4 @@ func sameTenants(a, b []hproto.Tenant) bool {
 		}
 	}
 	return true
-}
-
-func tenantLabel(t hproto.Tenant) string {
-	if t.Name == "" || t.Name == t.ID {
-		return t.ID
-	}
-	return t.Name + " (" + t.ID + ")"
-}
-
-func joinNonEmpty(sep string, parts ...string) string {
-	var out []string
-	for _, p := range parts {
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return strings.Join(out, sep)
 }

@@ -7,6 +7,7 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/claimward/claimward-vpn-client/pkg/appcore"
@@ -21,13 +22,21 @@ const testW, testH = 460, 720
 func newTestView(t *testing.T, f *fakeCore) (*View, *ViewModel) {
 	t.Helper()
 	q := &Queue{}
-	vm := NewViewModel(f, WithDispatch(func(fn func()) { fn() }, q.Post))
+	vm := NewViewModel(f, WithPost(q.Post))
 	v := NewView(vm, q)
-	t.Cleanup(v.Close)
+	t.Cleanup(func() { vm.Stop(); vm.Wait(); v.Close() })
 	vm.Refresh()
 	v.Resize(testW, testH, 1)
 	frame(t, v)
 	return v, vm
+}
+
+// settleView waits for every action to finish, then runs one frame, which
+// drains what they posted.
+func settleView(t *testing.T, v *View, vm *ViewModel) {
+	t.Helper()
+	vm.Wait()
+	frame(t, v)
 }
 
 // frame runs one tick and reports whether it drew.
@@ -92,7 +101,7 @@ func TestClickingConnect(t *testing.T) {
 		t.Error("Connect and Disconnect are not enabled as the state says")
 	}
 	click(t, v, v.w.connect)
-	frame(t, v)
+	settleView(t, v, vm)
 	if f.called("Connect") != 1 || vm.State.Get() != "Connected" || v.w.state.Text().Get() != "Connected" {
 		t.Errorf("Connect called %d times; state %q", f.called("Connect"), v.w.state.Text().Get())
 	}
@@ -105,7 +114,7 @@ func TestClickingConnect(t *testing.T) {
 		t.Error("a disabled Connect connected")
 	}
 	click(t, v, v.w.disconnect)
-	frame(t, v)
+	settleView(t, v, vm)
 	if f.called("Disconnect") != 1 || v.w.state.Text().Get() != "Disconnected" {
 		t.Errorf("Disconnect called %d times; state %q", f.called("Disconnect"), v.w.state.Text().Get())
 	}
@@ -123,12 +132,19 @@ func TestPanelsAppearWhenTheyApply(t *testing.T) {
 	if visible(v.w.tenantPick) {
 		t.Error("the tenant choice shows before a choice is needed")
 	}
-	click(t, v, v.w.connect)
+	// The sign-in is over (the prompt and the tenant choice never show at once).
+	f.set(func(st *appcore.Status) { st.DeviceVerificationURI, st.DeviceUserCode = "", "" })
+	vm.Refresh()
 	frame(t, v)
+	if visible(v.w.deviceCode) {
+		t.Error("the device prompt outlives the sign-in")
+	}
+	click(t, v, v.w.connect)
+	settleView(t, v, vm)
 	if vm.TenantPanel.Get() != PanelShown || !visible(v.w.tenantPick) {
 		t.Fatalf("the tenant choice is not shown after ErrTenantRequired: %+v", v.w.tenantPick.Bounds())
 	}
-	if v.w.message.Text().Get() != "You belong to several tenants: choose one, then Connect." {
+	if !strings.Contains(v.w.message.Text().Get(), "several tenants") {
 		t.Errorf("message %q", v.w.message.Text().Get())
 	}
 	// Choose through the DropDown, as a person does: open it, click a row.
@@ -144,7 +160,7 @@ func TestPanelsAppearWhenTheyApply(t *testing.T) {
 	if len(f.setTenant) != 1 || f.setTenant[0] != "hpc" {
 		t.Fatalf("SetTenant %v", f.setTenant)
 	}
-	if v.w.tenant.Text().Get() != "Tenant: HPC" {
+	if v.w.tenant.Text().Get() != "Tenant: HPC (hpc)" {
 		t.Errorf("tenant line %q", v.w.tenant.Text().Get())
 	}
 }
@@ -184,7 +200,7 @@ func TestTypingIntoTheSettings(t *testing.T) {
 		t.Errorf("pasted %q", vm.GitHubClientID.Get())
 	}
 	click(t, v, v.w.save)
-	frame(t, v)
+	settleView(t, v, vm)
 	if len(f.saved) != 1 || f.saved[0].ServerURL != "https://vpn.example.org" || f.saved[0].GitHubClientID != "Iv1.pasted" {
 		t.Fatalf("saved %+v", f.saved)
 	}
@@ -248,7 +264,7 @@ func TestAppearanceAndScale(t *testing.T) {
 
 func TestAWindowNotYetSized(t *testing.T) {
 	q := &Queue{}
-	vm := NewViewModel(signedOut(), WithDispatch(func(fn func()) { fn() }, q.Post))
+	vm := NewViewModel(signedOut(), WithPost(q.Post))
 	v := NewView(vm, q)
 	defer v.Close()
 	if buf, _, _, changed := v.Frame(); buf != nil || changed {

@@ -66,6 +66,13 @@ a goroutine and posts its result back through a queue that the window drains
 at the top of each frame. The status is polled every 2 seconds the same way. A
 tray click arrives on the tray's thread and is posted likewise.
 
+**Shared model.** The logic (screens, what each command may do, the status
+poll, the events) is `pkg/appvm` of `claimward-vpn-client` v0.7.0, shared with
+the Linux and macOS apps; the ViewModel only adapts it to observables. A dropped
+tunnel or an expired session becomes a notification (`tray.Notify`, once per
+transition; clicking it opens the window), and the window reports only the
+rectangles that changed (`DamageRects`) to the host.
+
 | Path | What |
 |------|------|
 | `cmd/claimward-app` | the app: window + tray (`application.Run`), Windows window lookup and the browser opener |

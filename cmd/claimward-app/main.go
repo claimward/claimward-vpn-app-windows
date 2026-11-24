@@ -10,8 +10,8 @@
 package main
 
 import (
-	"context"
 	"fmt"
+	"log"
 	"os"
 	"time"
 
@@ -44,8 +44,9 @@ func run() error {
 
 	queue := &ui.Queue{}
 	vm := ui.NewViewModel(core,
-		ui.WithDispatch(func(f func()) { go f() }, queue.Post),
-		ui.WithOpener(openURL),
+		ui.WithPost(queue.Post),
+		ui.WithOpener(application.OpenURL),
+		ui.WithInterval(2*time.Second, 500*time.Millisecond),
 		ui.WithConfigPath("Saved to "+appcore.ConfigPath()),
 	)
 	if err := ui.UseOpenTypeText(); err != nil {
@@ -54,16 +55,19 @@ func run() error {
 	view := ui.NewView(vm, queue)
 	defer view.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	vm.StartPolling(ctx, 2*time.Second)
+	vm.Start()
+	defer vm.Stop()
 
 	t := tray.New(brand.TrayIcon).SetTooltip("Claimward")
+	openWindow := func() { raiseWindow(windowTitle) }
 	unbind := ui.BindTray(t, vm, queue.Post, ui.TrayActions{
-		Open: func() { raiseWindow(windowTitle) },
+		Open: openWindow,
 		Quit: func() { closeWindow(windowTitle) },
 	})
 	defer unbind()
+	// The tunnel dropping or the session expiring is told to the person who is
+	// not looking at the window. A notification that cannot be shown is logged.
+	defer ui.BindNotifications(t, vm, openWindow, log.Printf)()
 	defer t.Quit()
 
 	spec := application.Spec{Name: "Claimward", Identifier: "org.claimward.vpn", Version: version}

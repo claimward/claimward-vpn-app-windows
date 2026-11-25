@@ -429,7 +429,15 @@ func (v *View) NativeControls() []toolkit.NativeControl {
 	return cs
 }
 
+// A11yElements describes the painted widgets to the platform's accessibility
+// layer (UI Automation): role, label and bounds of each, so a screen reader or
+// an automation client sees the buttons the toolkit draws.
+func (v *View) A11yElements() []application.A11yElement {
+	return application.A11yElementsOf(v.root)
+}
+
 var (
+	_ application.Accessible            = (*View)(nil)
 	_ application.NativeControlProvider = (*View)(nil)
 	_ application.Handler               = (*View)(nil)
 	_ application.ShortcutSink          = (*View)(nil)

@@ -59,7 +59,14 @@ func run() error {
 	defer vm.Stop()
 
 	t := tray.New(brand.TrayIcon).SetTooltip("Claimward")
-	openWindow := func() { raiseWindow(windowTitle) }
+	// application.Raise restores a minimised window and brings it forward on
+	// every back-end that can (Win32 and GTK; ErrNotSupported elsewhere, where
+	// the window is already open since closing it quits).
+	openWindow := func() {
+		if err := application.Raise(); err != nil {
+			log.Printf("claimward-app: raise window: %v", err)
+		}
+	}
 	unbind := ui.BindTray(t, vm, queue.Post, ui.TrayActions{
 		Open: openWindow,
 		Quit: func() { closeWindow(windowTitle) },

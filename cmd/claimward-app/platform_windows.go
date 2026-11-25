@@ -14,12 +14,8 @@ import (
 
 var (
 	user32            = windows.NewLazySystemDLL("user32.dll")
-	procShowWindow    = user32.NewProc("ShowWindow")
-	procSetForeground = user32.NewProc("SetForegroundWindow")
 	procPostMessage   = user32.NewProc("PostMessageW")
 	procGetWindowText = user32.NewProc("GetWindowTextW")
-	procIsIconic      = user32.NewProc("IsIconic")
-	swRestore, swShow = uintptr(9), uintptr(5)
 	wmClose           = uintptr(0x0010)
 	ourPID            = uint32(os.Getpid())
 )
@@ -44,27 +40,6 @@ func ourWindow(title string) windows.HWND {
 	})
 	_ = windows.EnumWindows(cb, nil)
 	return found
-}
-
-// raiseWindow restores the window if minimised and brings it forward.
-//
-// It is still done by hand. go-widgets/window v0.86.0 has window.Raise
-// (go-widgets/window#134), which does the same on Win32, but it needs the
-// window's back-end, and go-widgets/application v0.7.0's Run does not hand
-// it to the caller. The only other way to it is through the toolkit
-// clipboard Run installs, which would lean on an implementation detail of
-// application. Once Run exposes its window, this and ourWindow can go.
-func raiseWindow(title string) {
-	h := ourWindow(title)
-	if h == 0 {
-		return
-	}
-	if r, _, _ := procIsIconic.Call(uintptr(h)); r != 0 {
-		procShowWindow.Call(uintptr(h), swRestore)
-	} else {
-		procShowWindow.Call(uintptr(h), swShow)
-	}
-	procSetForeground.Call(uintptr(h))
 }
 
 // closeWindow asks the window to close, which ends application.Run and
